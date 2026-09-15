@@ -16,21 +16,39 @@ real increment, not an oversight.
 
 ## The dataset this pipeline consumes
 
-`~/data/Ancalagon_k39_results/k39pg_40ca_cascade_01_0100keV` ...
-`_88_8800keV` (88 completed Geant4 runs, 50000 events each), driven by
-matching reaction files in `~/codes/Ancalagon/reactions/`. Each run is
-the same ³⁹K(p,γ)⁴⁰Ca compound state (Ex = 8.93377 MeV, at the 606 keV
-resonance) decaying through **one fictional intermediate level**, stepped
-0.1 → 8.8 MeV in 0.1 MeV increments (file `NN` puts it at `NN × 0.1`
-MeV) — a two-step cascade, 100% branching at each step, no branching-ratio
-variation. This is **fundamentally different in shape from the old G3
-dataset**: that one was a 4558-sample, 6-parameter grid (3 level energies
-+ 3 branching ratios, all varying); this one is a dense **1-parameter
-scan** designed to map the BGO array's photopeak response (position,
-width, efficiency, escape/Compton structure) as a smooth function of true
-gamma-ray energy, not to reproduce a specific measured cascade. Don't
-port the old `ParametricSpectrumEmulator`'s architecture assuming the same
-kind of input space — see "Next steps".
+Two cascade topologies, both two-step scans of the same ³⁹K(p,γ)⁴⁰Ca
+606 keV resonance, combined into one 142-run `dataset.npz` (see
+`build_dataset.py`'s `DEFAULT_TOPOLOGIES`):
+
+- **`"ground"`** (added first): `~/data/Ancalagon_k39_results/k39pg_40ca_cascade_01_0100keV`
+  ... `_88_8800keV`, 88 runs, 50000 events each. Terminates at 40Ca's true
+  ground state (Ex = 8.93377 MeV above it); intermediate level stepped
+  0.1 → 8.8 MeV in 0.1 MeV steps.
+- **`"0+_2"`** (added 2026-09-14, later the same day): `k39pg_40ca_cascade0p2_01_0100keV`
+  ... `_54_5400keV`, 54 runs, **600000 events each** (12x the statistics
+  of the ground set). Terminates instead at the real 3.3526 MeV 0+_2
+  intruder state, because 0+_2 → ground is a 0+→0+ transition (forbidden
+  for single-photon emission) — real 40Ca de-excites that state by E0
+  conversion, not an observable gamma, so the reaction file stops the
+  tracked cascade there rather than emitting a fictitious final gamma
+  (see that file's own COMM header, or the reaction-file excerpt in
+  `parse_reaction.py`'s module docstring for the exact mechanism: RECL's
+  mass is deliberately shifted so the file's own "level 0" IS the 0+_2
+  state). Resonance excitation above 0+_2 is only 5.58117 MeV, so this
+  scan's intermediate level only goes 0.1 → 5.4 MeV.
+
+Both topologies share the same LEVL/BRAT structure (one intermediate
+level, 100/100% branching) — `parse_reaction.py`'s generic level-difference
+logic computes correct *observable* gamma energies for both with no
+topology-specific code, and `build_dataset.py` tags each row with a
+`topology` field purely for provenance/filtering. Every run is a
+**1-parameter scan** designed to map the BGO array's photopeak response
+(position, width, efficiency) as a smooth function of true gamma-ray
+energy, not to reproduce a specific measured cascade — this is
+**fundamentally different in shape from the old G3 dataset** (a
+4558-sample, 6-parameter grid). Don't port the old
+`ParametricSpectrumEmulator`'s architecture assuming the same kind of
+input space — see "Next steps".
 
 ## Format differences from the G3 project (read this before reusing G3 code)
 
@@ -83,8 +101,8 @@ kind of input space — see "Next steps".
 |------|---------|
 | `parse_reaction.py` | Parses Ancalagon `.reaction` files (`BEAM`/`TARG`/`RECL`/`ERES`/`LEVL`/`BRAT` cards) into level energies, branching, derived Q-value/Ex, and enumerates every resonance→ground cascade path with its energies and probability. Generalizes beyond the 2-level scan files (tested against the bundled `o15ag_19ne.reaction`, a real 4-level cascade). |
 | `extract_spectrum.py` | Per-event BGO spectrum from `dragon_hits.root` — `"addback"` or `"singles"` energy definition (see above), normalised by `n_total` (from `run.log`, since zero-hit events leave no row in the ROOT tree at all). |
-| `build_dataset.py` | Matches every `k39pg_40ca_cascade_*.reaction` file to its result directory by stem, runs both parsers, saves `dataset.npz`. |
-| `dataset.npz` | Built output: `X` (88, 6) — `br(-1,1)`, `br(1,0)`, `eres`, `ex`, `level(1)`, `q_value` (only `level(1)` actually varies across rows; the rest are dataset-wide constants, kept for a future mixed-topology dataset); `Y_addback`/`Y_singles` (88, 500) — normalised spectra; `edges` (501,) bin edges in MeV; `n_total`/`n_hit` (88,) — simulated events / events with ≥1 BGO hit; `file_stems` (88,). |
+| `build_dataset.py` | Matches each configured topology's reaction files to their result directories by stem, runs both parsers, tags each row with its `topology`, saves the combined `dataset.npz`. |
+| `dataset.npz` | Built output: `X` (142, 6) — `br(-1,1)`, `br(1,0)`, `eres`, `ex`, `level(1)`, `q_value` (`level(1)` varies within each topology; `ex`/`q_value` are constant *within* a topology but differ *between* them — 8.93377 MeV for `"ground"`, 5.58117 MeV for `"0+_2"`); `Y_addback`/`Y_singles` (142, 500) — normalised spectra; `edges` (501,) bin edges in MeV; `n_total`/`n_hit` (142,) — simulated events / events with ≥1 BGO hit (`n_total` is 50000 for `"ground"` rows, 600000 for `"0+_2"` rows); `file_stems`/`topology` (142,). |
 | `sanity_check_spectra.png` | Three example spectra (level = 0.5, 4.5, 8.5 MeV), addback vs. singles overlaid — used to visually confirm the pipeline (see "Verification" below). |
 | `fit_response_function.py` | For each run, fits both known photopeaks in `Y_singles` (local single-Gaussian fits if well-separated, joint double-Gaussian if the two peaks' windows overlap — happens for `level(1))` roughly 3.8–5.2 MeV) → per-energy (sigma, amplitude) measurements → global fit of `sigma(E)^2 = (doppler_k*E)^2 + intrinsic_k^2*E`. Saves `response_function.npz`. |
 | `response_function.py` | `BgoResponseFunction` class: loads the fitted model, predicts photopeak position/width/amplitude at any true gamma energy, and sums photopeaks over an arbitrary cascade's gamma list (`predict_spectrum`). Photopeak component only — see its own docstring. |
@@ -111,7 +129,8 @@ python extract_spectrum.py path/to/run_dir --method addback   # inspect one run'
   enumerates the real 4-branch `o15ag_19ne.reaction` cascade with
   probabilities summing to 100%.
 - `extract_spectrum.py`'s event count matches `run.log`'s line count
-  exactly (50000 for every run so far); addback vs. singles behave as
+  exactly (50000 for every `"ground"` run, 600000 for every `"0+_2"` run);
+  addback vs. singles behave as
   physically expected — e.g. for `level=4.50 MeV` (gammas at 4.434 and
   4.500 MeV, nearly degenerate), `singles` shows a hard cutoff just above
   the higher individual gamma energy (a single crystal can't register
@@ -125,102 +144,115 @@ python extract_spectrum.py path/to/run_dir --method addback   # inspect one run'
   two gammas is very low-energy and easily below detection/threshold
   effects).
 
-## Response function results (2026-09-14)
+## Response function results
 
-Fit via `fit_response_function.py` over all 88 runs (each contributing 2
-known photopeak energies, 174 total, 1 fit failure — see caveats):
+**2026-09-14, initial fit (ground topology only, 88 runs, superseded
+below):** `doppler_k = 0.0163 ± 0.00002`, `intrinsic_k = 0.0117 ± 0.00007`,
+resolution chi2/ndf ≈ 50. Held-out validation (17 runs held out) confirmed
+the fit generalizes (held-out chi2/ndf 56.2, close to train's 49.3) — see
+git history for the full original writeup. Superseded once the 0+_2
+topology was added; kept here only as a before/after reference point.
 
-- **Resolution model**: `doppler_k = 0.0163 ± 0.00002`,
-  `intrinsic_k = 0.0117 ± 0.00007` (same functional form as the G3
-  project, refit fresh — different geometry/physics, coefficients are not
-  expected to match and don't: G3 had `doppler_k=0.0210, intrinsic_k=0.0142`).
-  `response_function_check.png`'s left panel shows an almost perfectly
-  linear sigma-vs-E trend (Doppler-dominated above ~0.5 MeV, same
-  qualitative finding as the G3 project), with measured points tracking
-  the fitted curve closely outside the near-degenerate region below.
-- **`predict_spectrum` validated visually**
-  (`response_function_prediction_check.png`): both photopeak position and
-  width are reproduced essentially exactly across a wide energy range
-  (checked at 2.0/6.93 MeV and 1.93/7.0 MeV) — confirms the resolution
-  model generalizes, not just fits its own training points.
-- **Known caveats, not yet fixed**:
-  - One run (`level(1)=4.5`, the two gammas only 66 keV apart — the
-    closest-approach point in this scan) failed to converge; the
-    near-degenerate region generally (roughly 3.8–5.2 MeV) has visibly
-    larger scatter/error bars in `response_function_check.png` — a joint
-    double-Gaussian fit is inherently harder to constrain when the two
-    peaks strongly overlap. Not fixed; excluded via the `sigma_rel_err`
-    quality cut in the global resolution fit.
-  - The efficiency/amplitude curve (`response_function_check.png`, right
-    panel) has a real, physical downward trend (photoelectric absorption
-    less likely as E grows) but the lowest 2-3 energy points (~0.1-0.3
-    MeV) are **not reliable**: a large near-zero-energy spike in the raw
-    spectrum (partial-deposit events, not a physics peak) sits right next
-    to the real photopeak there and leaks into the local quadratic
-    background fit, suppressing the fitted amplitude — confirmed by
-    inspecting the raw bin values directly (a real peak is visible at
-    ~0.09-0.11 MeV once you look past the spike at ~0.01 MeV). Not fixed;
-    `full_energy_amplitude()` will under-report efficiency below ~0.3-0.5
-    MeV until this is addressed (e.g. exclude the near-zero region
-    explicitly from the local background fit, or model it as its own
-    component).
-  - **Photopeak component only**: Compton continuum, escape peaks, and
-    Compton edges are not modeled (`predict_spectrum` will look like the
-    orange curves in `response_function_prediction_check.png`, not the
-    full blue spectrum). This needs a genuinely joint fit across runs
-    (each run's continuum is itself a superposition from both its
-    gammas), which is real, separate follow-up work.
+**2026-09-14, later the same day: 0+_2 topology added, 142 runs
+combined.** Refit via `fit_response_function.py` over both topologies
+(282 peak measurements, 3 fit failures — mostly the ground set's known
+`level(1)=4.5` near-degenerate case):
 
-## Held-out validation (2026-09-14 follow-up)
+- **Resolution model**: `doppler_k = 0.01553 ± 0.00001`,
+  `intrinsic_k = 0.01248 ± 0.00002` — shifted modestly from the
+  ground-only fit, as expected with ~1.6x more measurements at much
+  higher per-run statistics (600000 vs 50000 events) pulling the fit.
+- **Independent cross-check, a genuinely new and reassuring result**: the
+  two topologies were generated independently (different final state,
+  different statistics, months apart in practice) but their energy
+  ranges overlap (0.1-5.4 MeV in both). `response_function_check.png`
+  shows both topologies' sigma(E) measurements landing on the same curve
+  in that overlap region — real agreement between two independent
+  simulation campaigns, not just internal self-consistency of one.
+- **chi2/ndf rose sharply (49 -> 305)** — this looks alarming but isn't
+  new physics breaking: the 0+_2 runs' 12x higher statistics shrink each
+  peak's fitted `sigma_err` by roughly sqrt(12) ≈ 3.5x, which inflates
+  chi2 = (data-model)^2/err^2 for the *same* absolute-sized real
+  imperfection in the local quadratic-background peak model (already a
+  known limitation, see below) by roughly that same factor. Confirmed
+  this isn't overfitting via `validate_holdout.py`: held-out chi2/ndf
+  (325.8) tracks train chi2/ndf (304.1) closely, same relationship as
+  before scaled up. The higher statistics are simply making a
+  pre-existing, already-documented imperfection statistically sharper,
+  not revealing a new one.
+- **New issue found: naive efficiency-curve interpolation degrades when
+  combining topologies.** Held-out amplitude relative error got
+  noticeably worse (median 1.9%->8.7%, mean 5.2%->21.0%, max
+  59.6%->134.8%) than sigma's (which stayed similar: median 4.5%->4.9%).
+  Root cause, confirmed by inspection: the two topologies' own
+  near-degenerate regions land at *different* absolute energies (ground's
+  is ~3.8-5.2 MeV since its Ex=8.93 MeV; 0+_2's is ~2.4-3.2 MeV since its
+  Ex=5.58 MeV is smaller) — so in the 2.4-3.2 MeV window, ground-topology
+  amplitudes come from ordinary, reliable single-peak fits while 0+_2
+  amplitudes in that *same* window come from its own less-reliable joint
+  double-Gaussian fits (confirmed directly: every amplitude checked there
+  had `joint=True`, chi2/ndf in the hundreds-to-thousands). The flat
+  sorted-by-energy `np.interp` in `build_efficiency_curve` doesn't
+  distinguish the two, so held-out points sometimes interpolate against a
+  neighboring point of the less-reliable kind. **Not fixed** — see "Next
+  steps". Sigma wasn't hit nearly as hard because the resolution model is
+  a global 2-parameter fit (robust to a few noisy points) rather than a
+  raw interpolation.
+- **`predict_spectrum` re-validated with a genuinely held-out check this
+  time** (`response_function_prediction_check.png`, regenerated using
+  `validate_holdout.py`'s train-only fit): both a `"ground"` run
+  (level=6700keV) and a `"0+_2"` run (level=4000keV), neither used in
+  that fit, show both photopeak position and width reproduced accurately.
+  (The previous version of this plot used runs that were part of the
+  fit's own training data — a mistake caught and fixed, see
+  [[feedback-always-holdout-validate]].)
+- **Still-open caveats, unchanged from before**: low-energy (<~0.5 MeV)
+  amplitude contamination from the near-zero spike; photopeak component
+  only, no Compton continuum/escape peaks/Compton edge yet.
 
-The result above was originally fit on **all 88 runs at once** — no
-train/test split — so the "prediction check" plot only showed the model
-reproducing runs it had itself been fit on, not genuine generalization.
-`validate_holdout.py` redoes this properly: holds out every 5th run on
-the `level(1)` grid (17 runs / 33 peak measurements, spread across the
-whole 0.1–8.8 MeV range), refits `doppler_k`/`intrinsic_k` and the
-efficiency interpolation on the remaining 70 runs only, then checks both
-against the runs the fit never saw.
+## Held-out validation
 
-- **Fitted parameters barely move**: train-only
-  `doppler_k=0.01628±0.00003, intrinsic_k=0.01153±0.00008` vs.
-  all-data `doppler_k=0.0163, intrinsic_k=0.0117` — consistent to well
-  within 1-sigma.
-- **Held-out chi2/ndf (56.2) is close to train chi2/ndf (49.3)** — if the
-  2-parameter resolution model were overfitting the training points, held-out
-  chi2 would be much worse than train chi2; it isn't. The elevated chi2/ndf
-  itself (~50, not ~1) is consistent with the already-documented per-peak
-  local-background-model imperfection, not with overfitting — it affects
-  train and held-out points equally.
-- **Held-out relative differences**: sigma median 4.5% / mean 6.4% / max
-  53.3%; amplitude median 1.9% / mean 5.2% / max 59.6% — small typical
-  errors, with the max outliers traced to the *already-documented* problem
-  points, not new ones: the 53.3% sigma outlier is `E=4.334 MeV` (the
-  `level(1)=4.6` run's low gamma, inside the known near-degenerate
-  ~3.8-5.2 MeV region), and the 59.6% amplitude outlier is `E=0.334 MeV`
-  (the `level(1)=8.6` run's low gamma, below ~0.5 MeV — the known
-  near-zero-spike contamination zone). See `holdout_validation.png`.
-- **Conclusion**: the resolution model and efficiency curve generalize
-  about as well on unseen energies as they fit their own training points
-  — the fit is not overfitting the 88-point grid. The shipped
-  `response_function.npz`/`response_function.py` still use **all 88
-  runs** (standard practice: validate with a holdout split, then ship the
-  full-data fit for best accuracy) — only `validate_holdout.py`'s own
-  run uses a train-only subset, and only for this check.
+`validate_holdout.py` holds out every 5th run across the *combined*
+142-run dataset (28 runs / 56 peak measurements: 10 from `"0+_2"`, 18
+from `"ground"`), refits on the remaining 113 runs, checks both the
+resolution model and efficiency curve against runs the fit never saw.
+
+- Train-only fit: `doppler_k=0.01543±0.00001, intrinsic_k=0.01280±0.00003`
+  — consistent with the all-data fit above.
+- Held-out chi2/ndf (325.8) tracks train chi2/ndf (304.1) — not
+  overfitting, same conclusion as before just at the new, higher
+  chi2/ndf scale (see "chi2/ndf rose sharply" above for why that scale
+  moved).
+- Held-out sigma relative difference: median 4.9%, mean 8.2%, max 54.2%
+  — essentially unchanged from the ground-only result.
+- Held-out amplitude relative difference: median 8.7%, mean 21.0%, max
+  134.8% — **materially worse than before** (was 1.9%/5.2%/59.6%); this
+  is the efficiency-interpolation issue above showing up quantitatively
+  in the held-out check, not a new held-out-specific problem — a real,
+  now-measured degradation worth fixing before trusting
+  `full_energy_amplitude()` between ~2-3.5 MeV.
+- The shipped `response_function.npz` still uses **all 142 runs** for
+  the same reason as before (validate with a split, ship the full-data
+  fit); only `validate_holdout.py`'s own run uses a train-only subset.
 
 ## Next steps
 
-1. Model the Compton continuum + escape peaks/Compton edge, most likely
-   via a joint NNLS-style decomposition across all 88 runs simultaneously
+1. Fix the efficiency-curve interpolation issue above — e.g. exclude
+   `joint=True` amplitude measurements from `build_efficiency_curve`
+   entirely (they're already known less-reliable), or fit a smooth
+   parametric efficiency(E) model instead of raw `np.interp` so a single
+   noisy neighbor can't dominate a nearby held-out prediction.
+2. Model the Compton continuum + escape peaks/Compton edge, most likely
+   via a joint NNLS-style decomposition across all runs simultaneously
    (same spirit as the G3 project's approach, but here every basis
    function's position is known analytically in advance, no PCA needed).
-2. Fix the low-energy (<~0.5 MeV) amplitude contamination from the
-   near-zero spike (see above) before trusting the efficiency curve there.
-3. Investigate/improve the near-degenerate region (~3.8-5.2 MeV) — wider
-   or better-conditioned joint fits, or a different parameterization that
-   doesn't require independently resolving two heavily-overlapping peaks.
-4. Only one cascade topology exists so far (single intermediate level,
-   100/100% branching) — if this response function is to feed into a
-   future full-cascade emulator (once Ancalagon has branching-ratio
-   variation and a working recoil gate), that needs new Ancalagon runs,
-   not just more of the current scan.
+   The 0+_2 topology's much higher statistics should help constrain this.
+3. Fix the low-energy (<~0.5 MeV) amplitude contamination from the
+   near-zero spike (unchanged from before).
+4. Investigate/improve the near-degenerate region in each topology (each
+   has its own, at a different absolute energy — see above) — wider or
+   better-conditioned joint fits, or a parameterization that doesn't
+   require independently resolving two heavily-overlapping peaks.
+5. Both topologies still have only one cascade shape (single intermediate
+   level, 100/100% branching) — branching-ratio variation needs new
+   Ancalagon runs, not just more of either current scan.
