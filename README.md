@@ -89,7 +89,9 @@ kind of input space — see "Next steps".
 | `fit_response_function.py` | For each run, fits both known photopeaks in `Y_singles` (local single-Gaussian fits if well-separated, joint double-Gaussian if the two peaks' windows overlap — happens for `level(1))` roughly 3.8–5.2 MeV) → per-energy (sigma, amplitude) measurements → global fit of `sigma(E)^2 = (doppler_k*E)^2 + intrinsic_k^2*E`. Saves `response_function.npz`. |
 | `response_function.py` | `BgoResponseFunction` class: loads the fitted model, predicts photopeak position/width/amplitude at any true gamma energy, and sums photopeaks over an arbitrary cascade's gamma list (`predict_spectrum`). Photopeak component only — see its own docstring. |
 | `response_function_check.png` | Sigma-vs-energy and amplitude-vs-energy scatter plots with the fitted resolution curve overlaid. |
-| `response_function_prediction_check.png` | `predict_spectrum` overlaid on two held-out-shaped real spectra — confirms both photopeak positions and widths are reproduced accurately across the whole energy range. |
+| `response_function_prediction_check.png` | `predict_spectrum` overlaid on two real spectra — confirms both photopeak positions and widths are reproduced accurately across the whole energy range. **Caveat**: the two runs shown here (`level=2000keV`/`7000keV`) were part of the fit's own training data, not a held-out check — see `validate_holdout.py` below for the real generalization test. |
+| `validate_holdout.py` | Proper train/held-out split: holds out every 5th run (~20%, spread across the whole `level(1)` grid), refits the resolution model + efficiency curve on the rest, checks both against the held-out runs. See "Held-out validation" below. |
+| `holdout_validation.png` | Train vs. held-out sigma(E) points with the train-only fitted curve, plus held-out relative-difference residuals. |
 
 ## Usage
 
@@ -168,6 +170,43 @@ known photopeak energies, 174 total, 1 fit failure — see caveats):
     full blue spectrum). This needs a genuinely joint fit across runs
     (each run's continuum is itself a superposition from both its
     gammas), which is real, separate follow-up work.
+
+## Held-out validation (2026-09-14 follow-up)
+
+The result above was originally fit on **all 88 runs at once** — no
+train/test split — so the "prediction check" plot only showed the model
+reproducing runs it had itself been fit on, not genuine generalization.
+`validate_holdout.py` redoes this properly: holds out every 5th run on
+the `level(1)` grid (17 runs / 33 peak measurements, spread across the
+whole 0.1–8.8 MeV range), refits `doppler_k`/`intrinsic_k` and the
+efficiency interpolation on the remaining 70 runs only, then checks both
+against the runs the fit never saw.
+
+- **Fitted parameters barely move**: train-only
+  `doppler_k=0.01628±0.00003, intrinsic_k=0.01153±0.00008` vs.
+  all-data `doppler_k=0.0163, intrinsic_k=0.0117` — consistent to well
+  within 1-sigma.
+- **Held-out chi2/ndf (56.2) is close to train chi2/ndf (49.3)** — if the
+  2-parameter resolution model were overfitting the training points, held-out
+  chi2 would be much worse than train chi2; it isn't. The elevated chi2/ndf
+  itself (~50, not ~1) is consistent with the already-documented per-peak
+  local-background-model imperfection, not with overfitting — it affects
+  train and held-out points equally.
+- **Held-out relative differences**: sigma median 4.5% / mean 6.4% / max
+  53.3%; amplitude median 1.9% / mean 5.2% / max 59.6% — small typical
+  errors, with the max outliers traced to the *already-documented* problem
+  points, not new ones: the 53.3% sigma outlier is `E=4.334 MeV` (the
+  `level(1)=4.6` run's low gamma, inside the known near-degenerate
+  ~3.8-5.2 MeV region), and the 59.6% amplitude outlier is `E=0.334 MeV`
+  (the `level(1)=8.6` run's low gamma, below ~0.5 MeV — the known
+  near-zero-spike contamination zone). See `holdout_validation.png`.
+- **Conclusion**: the resolution model and efficiency curve generalize
+  about as well on unseen energies as they fit their own training points
+  — the fit is not overfitting the 88-point grid. The shipped
+  `response_function.npz`/`response_function.py` still use **all 88
+  runs** (standard practice: validate with a holdout split, then ship the
+  full-data fit for best accuracy) — only `validate_holdout.py`'s own
+  run uses a train-only subset, and only for this check.
 
 ## Next steps
 

@@ -122,7 +122,13 @@ def _resolution_model(E, doppler_k, intrinsic_k):
     return np.sqrt((doppler_k * E) ** 2 + intrinsic_k**2 * E)
 
 
-def fit_all(dataset_path=DATASET_PATH, n_window_sigma=5.0, sigma_rel_err_max=0.5):
+def measure_all_peaks(dataset_path=DATASET_PATH, n_window_sigma=5.0, verbose=True):
+    """Per-run local peak fits only -- each run's fit is independent of
+    every other run, so this step is the same regardless of any later
+    train/holdout split. Returns a list of row dicts (one per lo/hi peak
+    per successfully-fit run): stem, which, energy, sigma, sigma_err,
+    amplitude, amplitude_err, chi2_ndf, sigma_rel_err, joint.
+    """
     d = np.load(dataset_path)
     labels = list(d["labels"])
     lvl = d["X"][:, labels.index("level(1)")]
@@ -142,7 +148,8 @@ def fit_all(dataset_path=DATASET_PATH, n_window_sigma=5.0, sigma_rel_err_max=0.5
         try:
             result = fit_run_peaks(centers, raw, e_lo_all[i], e_hi_all[i], n_window_sigma=n_window_sigma)
         except (RuntimeError, ValueError) as exc:
-            print(f"{stems[i]}: fit failed ({exc})")
+            if verbose:
+                print(f"{stems[i]}: fit failed ({exc})")
             continue
         for which in ("lo", "hi"):
             m = result[which]
@@ -155,42 +162,73 @@ def fit_all(dataset_path=DATASET_PATH, n_window_sigma=5.0, sigma_rel_err_max=0.5
                 "chi2_ndf": result[f"chi2_ndf_{which}"], "sigma_rel_err": sigma_rel_err,
                 "joint": result["joint"],
             })
-        print(f"{stems[i]}: E_lo={result['lo']['energy']:.3f} sigma_lo={result['lo']['sigma']*1000:.1f}keV  "
-              f"E_hi={result['hi']['energy']:.3f} sigma_hi={result['hi']['sigma']*1000:.1f}keV  "
-              f"chi2/ndf(lo/hi)={result['chi2_ndf_lo']:.2f}/{result['chi2_ndf_hi']:.2f} joint={result['joint']}")
+        if verbose:
+            print(f"{stems[i]}: E_lo={result['lo']['energy']:.3f} sigma_lo={result['lo']['sigma']*1000:.1f}keV  "
+                  f"E_hi={result['hi']['energy']:.3f} sigma_hi={result['hi']['sigma']*1000:.1f}keV  "
+                  f"chi2/ndf(lo/hi)={result['chi2_ndf_lo']:.2f}/{result['chi2_ndf_hi']:.2f} joint={result['joint']}")
+    return rows
+
+
+def fit_resolution_model(rows, sigma_rel_err_max=0.5, p0=(0.02, 0.015)):
+    """Fit sigma(E)^2 = (doppler_k*E)^2 + intrinsic_k^2*E to the given
+    rows (e.g. a training subset). Returns (doppler_k, intrinsic_k,
+    doppler_k_err, intrinsic_k_err, good_mask, chi2_ndf)."""
+    energies = np.array([r["energy"] for r in rows])
+    sigmas = np.array([r["sigma"] for r in rows])
+    sigma_errs = np.array([r["sigma_err"] for r in rows])
+    rel_err = np.array([r["sigma_rel_err"] for r in rows])
+
+    good = np.isfinite(rel_err) & (rel_err < sigma_rel_err_max) & (sigmas > 0.002)
+    popt, pcov = curve_fit(
+        _resolution_model, energies[good], sigmas[good],
+        p0=p0, sigma=sigma_errs[good], absolute_sigma=True,
+        bounds=([0, 0], [1, 1]),
+    )
+    perr = np.sqrt(np.diag(pcov))
+    pred = _resolution_model(energies[good], *popt)
+    resid = (sigmas[good] - pred) / sigma_errs[good]
+    chi2_ndf = float(np.sum(resid**2) / max(good.sum() - 2, 1))
+    return popt[0], popt[1], perr[0], perr[1], good, chi2_ndf
+
+
+def build_efficiency_curve(rows, sigma_rel_err_max=0.5):
+    """Sorted (energy, amplitude) arrays for interpolation, from rows
+    passing the same quality cut as the resolution fit."""
+    energies = np.array([r["energy"] for r in rows])
+    sigmas = np.array([r["sigma"] for r in rows])
+    amplitudes = np.array([r["amplitude"] for r in rows])
+    rel_err = np.array([r["sigma_rel_err"] for r in rows])
+    good = np.isfinite(rel_err) & (rel_err < sigma_rel_err_max) & (sigmas > 0.002)
+    order = np.argsort(energies[good])
+    return energies[good][order], amplitudes[good][order]
+
+
+def fit_all(dataset_path=DATASET_PATH, n_window_sigma=5.0, sigma_rel_err_max=0.5):
+    rows = measure_all_peaks(dataset_path, n_window_sigma=n_window_sigma)
 
     energies = np.array([r["energy"] for r in rows])
     sigmas = np.array([r["sigma"] for r in rows])
     sigma_errs = np.array([r["sigma_err"] for r in rows])
     amplitudes = np.array([r["amplitude"] for r in rows])
     rel_err = np.array([r["sigma_rel_err"] for r in rows])
+    stems = np.array([r["stem"] for r in rows])
 
     good = np.isfinite(rel_err) & (rel_err < sigma_rel_err_max) & (sigmas > 0.002)
     print(f"\n{good.sum()}/{len(rows)} peak measurements pass quality cut (sigma_rel_err < {sigma_rel_err_max})")
 
-    popt, pcov = curve_fit(
-        _resolution_model, energies[good], sigmas[good],
-        p0=[0.02, 0.015], sigma=sigma_errs[good], absolute_sigma=True,
-        bounds=([0, 0], [1, 1]),
-    )
-    doppler_k, intrinsic_k = popt
-    perr = np.sqrt(np.diag(pcov))
-    pred = _resolution_model(energies[good], *popt)
-    resid = (sigmas[good] - pred) / sigma_errs[good]
-    chi2_ndf_res = float(np.sum(resid**2) / max(good.sum() - 2, 1))
-    print(f"doppler_k = {doppler_k:.5f} +/- {perr[0]:.5f}")
-    print(f"intrinsic_k = {intrinsic_k:.5f} +/- {perr[1]:.5f}")
-    print(f"resolution-model chi2/ndf = {chi2_ndf_res:.2f}")
+    doppler_k, intrinsic_k, doppler_k_err, intrinsic_k_err, _, chi2_ndf_res = fit_resolution_model(
+        rows, sigma_rel_err_max=sigma_rel_err_max)
+    print(f"doppler_k = {doppler_k:.5f} +/- {doppler_k_err:.5f}")
+    print(f"intrinsic_k = {intrinsic_k:.5f} +/- {intrinsic_k_err:.5f}")
+    print(f"resolution-model chi2/ndf (fit on all data, evaluated on all data) = {chi2_ndf_res:.2f}")
 
-    order = np.argsort(energies[good])
-    eff_energy = energies[good][order]
-    eff_amplitude = amplitudes[good][order]
+    eff_energy, eff_amplitude = build_efficiency_curve(rows, sigma_rel_err_max=sigma_rel_err_max)
 
     return {
         "energies": energies, "sigmas": sigmas, "sigma_errs": sigma_errs,
-        "amplitudes": amplitudes, "rel_err": rel_err, "good": good,
+        "amplitudes": amplitudes, "rel_err": rel_err, "good": good, "stems": stems,
         "doppler_k": doppler_k, "intrinsic_k": intrinsic_k,
-        "doppler_k_err": perr[0], "intrinsic_k_err": perr[1],
+        "doppler_k_err": doppler_k_err, "intrinsic_k_err": intrinsic_k_err,
         "resolution_chi2_ndf": chi2_ndf_res,
         "efficiency_energy": eff_energy, "efficiency_amplitude": eff_amplitude,
     }
