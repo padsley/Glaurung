@@ -175,16 +175,27 @@ def measure_all_peaks(dataset_path=DATASET_PATH, n_window_sigma=5.0, verbose=Tru
     train/holdout split. Returns a list of row dicts (one per *distinct*
     true-energy peak per successfully-fit run -- see `_dedupe_gammas` for
     why two gammas can collapse into one row): stem, which, energy,
-    sigma, sigma_err, amplitude, amplitude_err, chi2_ndf, sigma_rel_err,
-    joint, multiplicity. `multiplicity > 1` means this row's amplitude is
-    the combined contribution of that many coincident-energy gammas, not
-    directly comparable to an ordinary single-gamma amplitude at a nearby
-    energy -- see README's caveat on this.
+    sigma, sigma_err, amplitude, amplitude_err, efficiency, chi2_ndf,
+    sigma_rel_err, joint, multiplicity. `multiplicity > 1` means this
+    row's amplitude/efficiency is the combined contribution of that many
+    coincident-energy gammas, not directly comparable to an ordinary
+    single-gamma value at a nearby energy -- see README's caveat on this.
+
+    `amplitude` is the fitted Gaussian's peak *height* (counts/event/bin)
+    -- it conflates true detection efficiency with resolution (a narrower
+    peak of the same efficiency is taller), which made it a noisy,
+    resolution-entangled quantity to interpolate vs. energy. `efficiency`
+    is the same peak's *area* (`amplitude * sigma * sqrt(2*pi) /
+    bin_width`, i.e. total counts/event integrated across however many
+    bins the peak actually spans) -- a resolution-independent, genuinely
+    physical full-energy-peak detection probability, and the quantity
+    `build_efficiency_curve`/`BgoResponseFunction` now use.
     """
     d = np.load(dataset_path, allow_pickle=True)
     n_total = d["n_total"].astype(np.float64)
     edges = d["edges"]
     centers = 0.5 * (edges[:-1] + edges[1:])
+    bin_width = edges[1] - edges[0]
     Y_singles = d["Y_singles"]
     stems = d["file_stems"]
     gamma_energies = d["gamma_energies"]  # (n_rows, max_gammas), NaN-padded
@@ -202,11 +213,13 @@ def measure_all_peaks(dataset_path=DATASET_PATH, n_window_sigma=5.0, verbose=Tru
             continue
         for rank, m in enumerate(result["peaks"]):
             sigma_rel_err = m["sigma_err"] / m["sigma"] if m["sigma"] > 0 else np.inf
+            amplitude = m["amplitude"] / n_total[i]  # normalise to per-simulated-event
+            sigma = m["sigma"]
             rows.append({
                 "stem": str(stems[i]), "which": f"p{rank}", "energy": m["energy"],
-                "sigma": m["sigma"], "sigma_err": m["sigma_err"],
-                "amplitude": m["amplitude"] / n_total[i],  # normalise to per-simulated-event
-                "amplitude_err": m["amplitude_err"] / n_total[i],
+                "sigma": sigma, "sigma_err": m["sigma_err"],
+                "amplitude": amplitude, "amplitude_err": m["amplitude_err"] / n_total[i],
+                "efficiency": amplitude * sigma * np.sqrt(2 * np.pi) / bin_width,
                 "chi2_ndf": result["chi2_ndf"][rank], "sigma_rel_err": sigma_rel_err,
                 "joint": result["joint"][rank], "multiplicity": result["multiplicity"][rank],
             })
@@ -238,23 +251,60 @@ def fit_resolution_model(rows, sigma_rel_err_max=0.5, p0=(0.02, 0.015)):
     return popt[0], popt[1], perr[0], perr[1], good, chi2_ndf
 
 
-def build_efficiency_curve(rows, sigma_rel_err_max=0.5):
-    """Sorted (energy, amplitude) arrays for interpolation, from rows
-    passing the same quality cut as the resolution fit. Also drops
-    `multiplicity > 1` rows (see `_dedupe_gammas`) -- their amplitude is
-    the combined contribution of >=2 coincident-energy gammas, not an
-    ordinary single-gamma full-energy-peak probability, so mixing them
-    into this curve would bias it at exactly those energies (unlike
-    sigma, which the resolution fit still uses them for -- coincident
-    gammas don't bias a *width* measurement)."""
+def build_efficiency_curve(rows, sigma_rel_err_max=0.5, chi2_ndf_max=50.0, bin_width=0.1):
+    """Smoothed (energy, efficiency) control points for interpolation.
+
+    Built from rows passing the same quality cut as the resolution fit,
+    plus **excluding `multiplicity > 1` and `joint == True` rows
+    entirely** (not just down-weighting them): a joint multi-Gaussian fit
+    over an overlapping window lets amplitude and sigma trade off against
+    each other in an underdetermined way, and a coincident-energy row's
+    efficiency is the combined contribution of >=2 gammas, not an
+    ordinary single-gamma value -- both are unreliable/non-comparable at
+    exactly the energies they occur, which is what made the raw
+    interpolation this replaced sensitive to single bad neighbors (see
+    README's 2026-09-16 write-up). Sigma's own resolution fit still uses
+    these rows -- a joint fit's *width* is far less biased by the
+    amplitude/sigma trade-off than its amplitude is.
+
+    Also excludes `chi2_ndf >= chi2_ndf_max`: a small tail (~1.7% of
+    otherwise-clean rows) has a formally tight sigma_rel_err yet a
+    badly-fit background (chi2/ndf up to ~140), overwhelmingly the
+    already-documented near-zero-energy-spike contamination at <~0.5 MeV
+    (see README's "Next steps" -- a separate, not-yet-fixed issue, kept
+    out of the curve here rather than solved). Tightening this cut
+    further (tried down to chi2_ndf<10) starts discarding *good* rows
+    faster than bad ones, thinning bins enough to hurt accuracy rather
+    than help -- 50 was chosen empirically as the point that drops the
+    genuinely-bad tail without touching the bulk.
+
+    The surviving (clean, single-peak) rows are then binned by energy
+    (`bin_width` MeV) and the **median** efficiency taken per occupied
+    bin -- robust to any one remaining noisy point, unlike interpolating
+    between every raw row directly. Returns (bin_centers, bin_medians),
+    sorted; empty bins are simply absent (`np.interp` bridges any gap
+    linearly from its nearest neighbors, same as before).
+    """
     energies = np.array([r["energy"] for r in rows])
     sigmas = np.array([r["sigma"] for r in rows])
-    amplitudes = np.array([r["amplitude"] for r in rows])
+    efficiencies = np.array([r["efficiency"] for r in rows])
     rel_err = np.array([r["sigma_rel_err"] for r in rows])
     multiplicity = np.array([r["multiplicity"] for r in rows])
-    good = np.isfinite(rel_err) & (rel_err < sigma_rel_err_max) & (sigmas > 0.002) & (multiplicity == 1)
-    order = np.argsort(energies[good])
-    return energies[good][order], amplitudes[good][order]
+    joint = np.array([r["joint"] for r in rows])
+    chi2_ndf = np.array([r["chi2_ndf"] for r in rows])
+    good = (np.isfinite(rel_err) & (rel_err < sigma_rel_err_max) & (sigmas > 0.002)
+            & (multiplicity == 1) & ~joint & (chi2_ndf < chi2_ndf_max))
+
+    e_good, eff_good = energies[good], efficiencies[good]
+    if len(e_good) == 0:
+        raise ValueError("no rows survive the efficiency-curve quality cut (all joint/coincident/noisy?)")
+
+    bin_index = np.floor(e_good / bin_width).astype(np.int64)
+    bins = np.unique(bin_index)
+    bin_centers = (bins.astype(np.float64) + 0.5) * bin_width
+    bin_medians = np.array([np.median(eff_good[bin_index == b]) for b in bins])
+    order = np.argsort(bin_centers)
+    return bin_centers[order], bin_medians[order]
 
 
 def fit_all(dataset_path=DATASET_PATH, n_window_sigma=5.0, sigma_rel_err_max=0.5):
@@ -264,6 +314,7 @@ def fit_all(dataset_path=DATASET_PATH, n_window_sigma=5.0, sigma_rel_err_max=0.5
     sigmas = np.array([r["sigma"] for r in rows])
     sigma_errs = np.array([r["sigma_err"] for r in rows])
     amplitudes = np.array([r["amplitude"] for r in rows])
+    efficiencies = np.array([r["efficiency"] for r in rows])
     rel_err = np.array([r["sigma_rel_err"] for r in rows])
     stems = np.array([r["stem"] for r in rows])
 
@@ -276,15 +327,23 @@ def fit_all(dataset_path=DATASET_PATH, n_window_sigma=5.0, sigma_rel_err_max=0.5
     print(f"intrinsic_k = {intrinsic_k:.5f} +/- {intrinsic_k_err:.5f}")
     print(f"resolution-model chi2/ndf (fit on all data, evaluated on all data) = {chi2_ndf_res:.2f}")
 
-    eff_energy, eff_amplitude = build_efficiency_curve(rows, sigma_rel_err_max=sigma_rel_err_max)
+    eff_energy, eff_curve = build_efficiency_curve(rows, sigma_rel_err_max=sigma_rel_err_max)
+    joint_arr = np.array([r["joint"] for r in rows])
+    mult_arr = np.array([r["multiplicity"] for r in rows])
+    chi2_arr = np.array([r["chi2_ndf"] for r in rows])
+    n_clean = int((good & ~joint_arr & (mult_arr == 1) & (chi2_arr < 50.0)).sum())
+    print(f"efficiency curve: {len(eff_energy)} occupied bins "
+          f"(from {n_clean} clean single-peak measurements, "
+          f"non-joint + multiplicity=1 + chi2/ndf<50)")
 
     return {
         "energies": energies, "sigmas": sigmas, "sigma_errs": sigma_errs,
-        "amplitudes": amplitudes, "rel_err": rel_err, "good": good, "stems": stems,
+        "amplitudes": amplitudes, "efficiencies": efficiencies,
+        "rel_err": rel_err, "good": good, "stems": stems,
         "doppler_k": doppler_k, "intrinsic_k": intrinsic_k,
         "doppler_k_err": doppler_k_err, "intrinsic_k_err": intrinsic_k_err,
         "resolution_chi2_ndf": chi2_ndf_res,
-        "efficiency_energy": eff_energy, "efficiency_amplitude": eff_amplitude,
+        "efficiency_energy": eff_energy, "efficiency_curve": eff_curve,
     }
 
 

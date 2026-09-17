@@ -6,10 +6,12 @@ This is a **response-function model**, not a per-cascade regressor (see
 `README.md`'s "Open questions" / the follow-up memory note for why that
 framing fits this dataset better than porting the G3 project's
 `ParametricSpectrumEmulator`): given any true gamma-ray energy, it
-predicts the *shape* (position + energy-dependent width) and *amplitude*
-(full-energy-peak detection probability) of that gamma's contribution to
-a BGO singles spectrum. A full cascade's predicted spectrum is just the
-sum of `photopeak(E)` over its gammas -- see `predict_spectrum`.
+predicts the *shape* (position + energy-dependent width) and
+*efficiency* (full-energy-peak detection probability, i.e. peak area,
+not height -- see `full_energy_efficiency`'s docstring) of that gamma's
+contribution to a BGO singles spectrum. A full cascade's predicted
+spectrum is just the sum of `photopeak(E)` over its gammas -- see
+`predict_spectrum`.
 
 **Scope of this v1**: photopeak component only (Gaussian, energy-dependent
 width). It does NOT yet model the Compton continuum, escape peaks, or
@@ -27,18 +29,18 @@ import numpy as np
 
 class BgoResponseFunction:
     def __init__(self, doppler_k: float, intrinsic_k: float,
-                 efficiency_energy: np.ndarray, efficiency_amplitude: np.ndarray):
+                 efficiency_energy: np.ndarray, efficiency_curve: np.ndarray):
         self.doppler_k = doppler_k
         self.intrinsic_k = intrinsic_k
         self.efficiency_energy = np.asarray(efficiency_energy)
-        self.efficiency_amplitude = np.asarray(efficiency_amplitude)
+        self.efficiency_curve = np.asarray(efficiency_curve)
 
     @classmethod
     def load(cls, path: str = "response_function.npz") -> "BgoResponseFunction":
         d = np.load(path)
         return cls(
             doppler_k=float(d["doppler_k"]), intrinsic_k=float(d["intrinsic_k"]),
-            efficiency_energy=d["efficiency_energy"], efficiency_amplitude=d["efficiency_amplitude"],
+            efficiency_energy=d["efficiency_energy"], efficiency_curve=d["efficiency_curve"],
         )
 
     def sigma(self, E: np.ndarray) -> np.ndarray:
@@ -46,28 +48,37 @@ class BgoResponseFunction:
         E = np.asarray(E, dtype=np.float64)
         return np.sqrt((self.doppler_k * E) ** 2 + self.intrinsic_k**2 * E)
 
-    def full_energy_amplitude(self, E: np.ndarray) -> np.ndarray:
-        """Interpolated per-simulated-event full-energy-peak amplitude at
-        energy E (MeV) -- clipped to the measured range's boundary values
-        outside [0.13, 8.83] MeV (no extrapolation model yet). Below
-        ~0.3-0.5 MeV this is known to be contaminated by a large
-        near-zero-energy spike in the raw data (partial-deposit/threshold
-        events) leaking into the local peak fit's background -- see
-        README's "Verification" section -- treat amplitudes there as
-        unreliable, not just low.
+    def full_energy_efficiency(self, E: np.ndarray) -> np.ndarray:
+        """Interpolated per-simulated-event full-energy-peak detection
+        probability at energy E (MeV) -- the fitted Gaussian peak's
+        *area* (`amplitude * sigma * sqrt(2*pi) / bin_width`), not its
+        height, so it's a genuine, resolution-independent efficiency
+        (see `fit_response_function.py`'s `measure_all_peaks` docstring
+        for why that distinction matters -- height alone conflated
+        efficiency with resolution and made the curve noisy). Built from
+        a robust median-per-energy-bin smoothing (`build_efficiency_curve`),
+        clipped to the measured range's boundary values outside
+        [0.13, 8.83] MeV (no extrapolation model yet). Below ~0.3-0.5 MeV
+        this is known to be contaminated by a large near-zero-energy
+        spike in the raw data (partial-deposit/threshold events) leaking
+        into the local peak fit's background -- see README's
+        "Verification" section -- treat efficiencies there as unreliable,
+        not just low.
         """
-        return np.interp(E, self.efficiency_energy, self.efficiency_amplitude)
+        return np.interp(E, self.efficiency_energy, self.efficiency_curve)
 
     def photopeak(self, E: float, energies: np.ndarray) -> np.ndarray:
         """Predicted photopeak contribution (counts per simulated event
         per bin) at bin centers `energies` (MeV), for one gamma of true
         energy E (MeV)."""
         sigma = self.sigma(E)
-        amplitude = self.full_energy_amplitude(E)
+        efficiency = self.full_energy_efficiency(E)
         bin_width = energies[1] - energies[0] if len(energies) > 1 else 1.0
-        # amplitude was fit as a peak height (counts/bin, already per-event-normalised);
-        # reproduce it as a height-normalised Gaussian, not an area-normalised one.
-        return amplitude * np.exp(-0.5 * ((energies - E) / sigma) ** 2)
+        # efficiency is an *area* (bin_width-normalised integrated counts/event);
+        # convert back to the height of the height-normalised Gaussian this
+        # spectrum's bins actually store, i.e. invert the Gaussian-area formula.
+        height = efficiency * bin_width / (sigma * np.sqrt(2 * np.pi))
+        return height * np.exp(-0.5 * ((energies - E) / sigma) ** 2)
 
     def predict_spectrum(self, gamma_energies: list[float], edges: np.ndarray) -> np.ndarray:
         """Sum of photopeak contributions for a cascade emitting the given
@@ -92,4 +103,4 @@ if __name__ == "__main__":
     rf = BgoResponseFunction.load(args.response)
     for E in args.energies:
         print(f"E={E:.4f} MeV: sigma={1000*rf.sigma(E):.1f} keV, "
-              f"amplitude={rf.full_energy_amplitude(E):.5f} counts/event")
+              f"efficiency={rf.full_energy_efficiency(E):.5f} counts/event")

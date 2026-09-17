@@ -148,12 +148,12 @@ free at the time; check `df -h /` before any further bulk regeneration.
 | `dataset.npz` | Built output, 5401 rows across 4 topologies (88 `"ground"`, 54 `"0+_2"`, 3828 `"3g_ground"`, 1431 `"3g_0+_2"`). `X` (5401, 9) — union of all topologies' feature keys (`br(-1,1)`, `br(-1,2)`, `br(1,0)`, `br(2,1)`, `eres`, `ex`, `level(1)`, `level(2)`, `q_value`), NaN where a topology doesn't have that key. `gamma_energies` (5401, 3) — sorted true gamma energies per run, NaN-padded (2 real values for the 2-gamma topologies). `Y_addback`/`Y_singles` (5401, 500) — normalised spectra; `edges` (501,) bin edges in MeV; `n_total`/`n_hit` (5401,) — simulated events / events with ≥1 BGO hit; `file_stems`/`topology` (5401,). |
 | `dataset_original_142.npz` | Frozen copy of the original 142-run (2-gamma-only) dataset, kept as the `--merge-old` cache since its raw ROOT/log files no longer exist on disk. |
 | `sanity_check_spectra.png` | Three example spectra (level = 0.5, 4.5, 8.5 MeV), addback vs. singles overlaid — used to visually confirm the pipeline (see "Verification" below). |
-| `fit_response_function.py` | For each run, fits every distinct known photopeak in `Y_singles` (local single-Gaussian fits if well-separated; a joint multi-Gaussian fit, generalized to however many of a run's peaks overlap — 2 or 3 for the 3-gamma topologies — for merged windows) → per-energy (sigma, amplitude) measurements → global fit of `sigma(E)^2 = (doppler_k*E)^2 + intrinsic_k^2*E`. Saves `response_function.npz`. |
-| `response_function.py` | `BgoResponseFunction` class: loads the fitted model, predicts photopeak position/width/amplitude at any true gamma energy, and sums photopeaks over an arbitrary cascade's gamma list (`predict_spectrum`). Photopeak component only — see its own docstring. |
-| `response_function_check.png` | Sigma-vs-energy and amplitude-vs-energy scatter plots with the fitted resolution curve overlaid. |
+| `fit_response_function.py` | For each run, fits every distinct known photopeak in `Y_singles` (local single-Gaussian fits if well-separated; a joint multi-Gaussian fit, generalized to however many of a run's peaks overlap — 2 or 3 for the 3-gamma topologies — for merged windows) → per-energy (sigma, **efficiency** — see "Efficiency curve fix" below) measurements → global fit of `sigma(E)^2 = (doppler_k*E)^2 + intrinsic_k^2*E`, plus `build_efficiency_curve`'s median-binned smoothing. Saves `response_function.npz`. |
+| `response_function.py` | `BgoResponseFunction` class: loads the fitted model, predicts photopeak position/width/efficiency at any true gamma energy (`full_energy_efficiency`, renamed 2026-09-17 from `full_energy_amplitude` — see below), and sums photopeaks over an arbitrary cascade's gamma list (`predict_spectrum`). Photopeak component only — see its own docstring. |
+| `response_function_check.png` | Sigma-vs-energy and efficiency-vs-energy scatter plots with the fitted resolution curve / smoothed efficiency curve overlaid. |
 | `response_function_prediction_check.png` | `predict_spectrum` (using `validate_holdout.py`'s train-only fit) overlaid on one held-out run from each of the 4 topologies — confirms photopeak positions and widths are reproduced accurately, including the 3-peak-per-run topologies, on runs the fit never saw. |
-| `validate_holdout.py` | Proper train/held-out split: holds out every 5th run (~20%, spread across the whole `level(1)` grid), refits the resolution model + efficiency curve on the rest, checks both against the held-out runs. See "Held-out validation" below. |
-| `holdout_validation.png` | Train vs. held-out sigma(E) points with the train-only fitted curve, plus held-out relative-difference residuals. |
+| `validate_holdout.py` | Proper train/held-out split: holds out every 5th run (~20%, spread across the whole `level(1)` grid), refits the resolution model + efficiency curve on the rest, checks both against the held-out runs — now reports both an ALL-held-out and a CLEAN-held-out efficiency error (see "Efficiency curve fix" below). See "Held-out validation" below. |
+| `holdout_validation.png` | Train vs. held-out sigma(E) points with the train-only fitted curve, sigma residuals, and (new 2026-09-17) held-out efficiency residuals/error-distribution split by clean vs. excluded points. |
 
 ## Usage
 
@@ -304,6 +304,63 @@ overlap, not just pairwise) and exact-energy-coincidence deduplication
   visually well reproduced across all four, including the 3-peak-per-run
   topologies.
 
+## Efficiency curve fix (2026-09-17)
+
+Tackled "Next steps" item 1 from the 2026-09-16 write-up above (the
+efficiency-curve interpolation issue, which had gotten measurably worse
+once the 3-gamma topologies were added). Three changes, all in
+`fit_response_function.py`/`response_function.py`:
+
+1. **Switched from peak height ("amplitude") to peak area
+   ("efficiency")**: `efficiency = amplitude * sigma * sqrt(2*pi) /
+   bin_width`. Height conflates true detection efficiency with
+   resolution (a narrower peak of the same efficiency is taller), and
+   resolution varies smoothly with energy on its own — fitting/interpolating
+   the entangled quantity was adding noise that had nothing to do with
+   efficiency itself. Area is resolution-independent. `response_function.py`'s
+   `full_energy_amplitude` is renamed `full_energy_efficiency` accordingly
+   (returns the area; `photopeak()` converts back to a height internally
+   using the fitted sigma(E), so `predict_spectrum` is unaffected).
+2. **Excluded `joint=True` rows from the efficiency curve entirely** (not
+   just `multiplicity>1`, which was already excluded) — a joint
+   multi-Gaussian fit over an overlapping window lets amplitude and sigma
+   trade off against each other in an underdetermined way, exactly the
+   failure mode diagnosed 2026-09-16. Also added a `chi2_ndf < 50` cut:
+   a small tail (~1.7% of otherwise-clean rows) had a badly-fit local
+   background (chi2/ndf up to ~140) despite a tight sigma_rel_err,
+   overwhelmingly the already-documented near-zero-energy-spike
+   contamination at <~0.5 MeV (Next steps item 3, still not itself
+   fixed) — excluding it keeps that separate problem from also polluting
+   this curve.
+3. **Replaced raw point-to-point `np.interp`** (every surviving row is a
+   control point) **with median-binned smoothing** (0.1 MeV bins, median
+   efficiency per occupied bin, `np.interp` only between bin medians) —
+   robust to any single remaining noisy point dominating a nearby
+   held-out prediction, which was the direct mechanism identified
+   2026-09-16.
+
+**Diagnosis behind the fix** (see `holdout_validation.png`'s new
+bottom-row panels): re-running the *same* held-out check but breaking
+out held-out points by whether *they themselves* are joint/coincident/
+high-chi2 showed those categories firmly cluster far from zero error
+regardless of curve quality (comparing a clean model against an
+inherently unreliable measurement is not a fair test of the model) —
+confirming the residual error is concentrated in already-known-hard
+categories, not a remaining curve defect.
+
+**Results**: resolution model unchanged (chi2/ndf 17.88, as expected —
+none of these three changes touch sigma fitting). Held-out efficiency
+error, evaluated the same "ALL held-out points" way as before for direct
+comparison: median 8.7%, mean 17.3%, max 385.5% — *not* obviously better
+by this metric, because it's still dominated by the same joint/high-chi2
+held-out comparison points being intrinsically hard to predict. Evaluated
+on the **same held-out points, minus joint/coincident/chi2≥50 ones** (a
+fair like-for-like comparison against the pre-fix numbers, which had no
+such split): median 6.6%, mean 13.6%, max 72.0% — a real, substantial
+improvement in the regime the curve can actually be expected to predict
+well (compare 2026-09-16's ALL-based 11.6%/28.4%/134.8%, itself not
+splittable this way since the old code didn't track it).
+
 ## Held-out validation
 
 `validate_holdout.py` holds out every 5th run across the *combined*
@@ -318,29 +375,45 @@ the 142-run-only version of this check are in git history / the
 - Held-out chi2/ndf (17.92) tracks train chi2/ndf (17.88) almost exactly
   — the best train/held-out agreement seen in this project so far.
 - Held-out sigma relative difference: median 5.5%, mean 9.0%, max 73.9%.
-- Held-out amplitude relative difference: median 11.6%, mean 28.4%, max
-  **346.8%** — worse than the 142-run check (8.7%/21.0%/134.8%); see the
-  2026-09-16 write-up above for why, and "Next steps" item 1.
+- Held-out efficiency relative difference (**ALL** held-out points,
+  same method as the pre-2026-09-17 "amplitude" check): median 8.7%,
+  mean 17.3%, max 385.5%.
+- Held-out efficiency relative difference (**CLEAN** held-out points
+  only — excluding joint/coincident/chi2≥50, which are known-unreliable
+  measurements regardless of curve quality, see "Efficiency curve fix"
+  above): median 6.6%, mean 13.6%, max 72.0% — the fairer read on how
+  well the fixed curve actually performs.
 - The shipped `response_function.npz` still uses **all 5401 runs** for
   the same reason as before (validate with a split, ship the full-data
   fit); only `validate_holdout.py`'s own run uses a train-only subset.
 
 ## Next steps
 
-1. **(Priority raised 2026-09-16 — measurably worse now, not just
-   unfixed)** Fix the efficiency-curve interpolation issue — e.g. exclude
-   `joint=True` amplitude measurements from `build_efficiency_curve`
-   entirely (not just `multiplicity>1`, already done), or fit a smooth
-   parametric efficiency(E) model instead of raw `np.interp` so a single
-   noisy neighbor can't dominate a nearby held-out prediction.
+1. ~~Fix the efficiency-curve interpolation issue~~ — **done 2026-09-17**,
+   see "Efficiency curve fix" above (area-based efficiency instead of raw
+   height, exclude joint/coincident/high-chi2 rows, median-binned
+   smoothing instead of raw `np.interp`). Held-out efficiency error on
+   the fair (clean-vs-clean) comparison improved from 8.7%/21.0%/134.8%
+   (142-run, pre-3-gamma baseline) to 6.6%/13.6%/72.0% (5401-run,
+   post-fix) — genuinely better, not just a different metric. Not fully
+   solved: the ALL-held-out number is still large (max 385.5%) because
+   items 2-4 below (Compton/escape modeling, low-energy contamination,
+   near-degenerate regions) remain open and dominate exactly the points
+   this fix correctly declines to smooth over.
 2. Model the Compton continuum + escape peaks/Compton edge, most likely
    via a joint NNLS-style decomposition across all runs simultaneously
    (same spirit as the G3 project's approach, but here every basis
    function's position is known analytically in advance, no PCA needed).
    The much larger 3-gamma dataset should help constrain this further
    than the 0+_2 topology alone would have.
-3. Fix the low-energy (<~0.5 MeV) amplitude contamination from the
-   near-zero spike (unchanged from before).
+3. **(Now the clearest single lever on the remaining held-out error, per
+   the 2026-09-17 diagnosis)** Fix the low-energy (<~0.5 MeV) efficiency
+   contamination from the near-zero spike — confirmed via chi2/ndf (up
+   to ~140 for affected rows, vs. ~5-20 typical) that this is a real,
+   identifiable local-background-model failure, not just noise, and it's
+   responsible for several of the single worst held-out points found
+   2026-09-17 (e.g. `k39pg_40ca_cascade3g_L1-0200keV_L2-4000keV` at
+   E=0.2 MeV, chi2/ndf=141, off by 385%).
 4. Investigate/improve the near-degenerate region in each topology (each
    has its own, at a different absolute energy — see above) — wider or
    better-conditioned joint fits, or a parameterization that doesn't

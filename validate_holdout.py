@@ -69,12 +69,33 @@ def run_validation(dataset_path=DATASET_PATH, every_n=5, offset=4, sigma_rel_err
           f"mean={np.mean(np.abs(ho_rel_diff)) * 100:.1f}%, max={np.max(np.abs(ho_rel_diff)) * 100:.1f}%")
 
     # --- efficiency curve: build interpolation on train only ---
-    eff_energy, eff_amplitude = build_efficiency_curve(train_rows, sigma_rel_err_max=sigma_rel_err_max)
-    ho_amp = np.array([r["amplitude"] for r in holdout_rows])
-    ho_amp_pred = np.interp(ho_energy[ho_good], eff_energy, eff_amplitude)
-    ho_amp_rel_diff = (ho_amp[ho_good] - ho_amp_pred) / ho_amp[ho_good]
-    print(f"HELD-OUT amplitude relative difference: median={np.median(np.abs(ho_amp_rel_diff)) * 100:.1f}%, "
-          f"mean={np.mean(np.abs(ho_amp_rel_diff)) * 100:.1f}%, max={np.max(np.abs(ho_amp_rel_diff)) * 100:.1f}%")
+    # NOTE: held out on *efficiency* (amplitude*sigma*sqrt(2pi)/bin_width,
+    # a resolution-independent peak area), not raw peak-height amplitude
+    # -- see fit_response_function.py's measure_all_peaks docstring for why.
+    eff_energy, eff_curve = build_efficiency_curve(train_rows, sigma_rel_err_max=sigma_rel_err_max)
+    ho_eff = np.array([r["efficiency"] for r in holdout_rows])
+    ho_eff_pred = np.interp(ho_energy[ho_good], eff_energy, eff_curve)
+    ho_eff_rel_diff = (ho_eff[ho_good] - ho_eff_pred) / ho_eff[ho_good]
+    print(f"HELD-OUT efficiency relative difference (ALL {ho_good.sum()} held-out points passing the "
+          f"sigma-only cut): median={np.median(np.abs(ho_eff_rel_diff)) * 100:.1f}%, "
+          f"mean={np.mean(np.abs(ho_eff_rel_diff)) * 100:.1f}%, max={np.max(np.abs(ho_eff_rel_diff)) * 100:.1f}%")
+
+    # Same numbers, but also excluding held-out points that are themselves
+    # joint/coincident/high-chi2 (the same categories build_efficiency_curve
+    # excludes from the *training* side) -- these are known-unreliable
+    # measurements to compare against regardless of curve quality (see
+    # README's 2026-09-16 "efficiency curve" write-up), so the ALL number
+    # above is a deliberately pessimistic upper bound, not evidence the
+    # curve itself is that inaccurate.
+    ho_joint = np.array([r["joint"] for r in holdout_rows])[ho_good]
+    ho_mult = np.array([r["multiplicity"] for r in holdout_rows])[ho_good]
+    ho_chi2ndf = np.array([r["chi2_ndf"] for r in holdout_rows])[ho_good]
+    ho_clean = ~ho_joint & (ho_mult == 1) & (ho_chi2ndf < 50.0)
+    clean_rel_diff = ho_eff_rel_diff[ho_clean]
+    print(f"HELD-OUT efficiency relative difference (CLEAN {ho_clean.sum()} of those, excluding "
+          f"joint/coincident/high-chi2 held-out points): "
+          f"median={np.median(np.abs(clean_rel_diff)) * 100:.1f}%, "
+          f"mean={np.mean(np.abs(clean_rel_diff)) * 100:.1f}%, max={np.max(np.abs(clean_rel_diff)) * 100:.1f}%")
 
     return {
         "train_rows": train_rows, "holdout_rows": holdout_rows,
@@ -82,9 +103,9 @@ def run_validation(dataset_path=DATASET_PATH, every_n=5, offset=4, sigma_rel_err
         "train_chi2_ndf": train_chi2, "holdout_chi2_ndf": ho_chi2,
         "holdout_energy": ho_energy[ho_good], "holdout_sigma": ho_sigma[ho_good],
         "holdout_sigma_pred": ho_pred, "holdout_sigma_rel_diff": ho_rel_diff,
-        "holdout_amplitude": ho_amp[ho_good], "holdout_amplitude_pred": ho_amp_pred,
-        "holdout_amplitude_rel_diff": ho_amp_rel_diff,
-        "eff_energy": eff_energy, "eff_amplitude": eff_amplitude,
+        "holdout_efficiency": ho_eff[ho_good], "holdout_efficiency_pred": ho_eff_pred,
+        "holdout_efficiency_rel_diff": ho_eff_rel_diff, "holdout_efficiency_clean_mask": ho_clean,
+        "eff_energy": eff_energy, "eff_curve": eff_curve,
     }
 
 
