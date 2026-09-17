@@ -55,34 +55,32 @@ def get_n_simulated_events(run_log_path: str) -> int:
     return n
 
 
-def get_event_energies(root_path: str, method: str = "addback") -> np.ndarray:
-    """Per-event total BGO energy deposit (MeV), one entry per event that
-    had >=1 hit (zero-hit events are not represented -- pad with the
-    known `n_total - len(result)` zeros yourself if you need every
-    simulated event, e.g. when histogramming for an efficiency-correct
-    spectrum -- `extract_spectrum` below does this).
-    """
-    if method not in ("addback", "singles"):
-        raise ValueError(f"method must be 'addback' or 'singles', got {method!r}")
-
+def _read_bgo_hits(root_path: str):
+    """One ROOT open, all three branches -- shared by both energy
+    definitions so a caller wanting both (`extract_both` below) doesn't
+    pay for two separate file opens."""
     with uproot.open(root_path) as f:
         tree = f["Bgo"]
         event_id = tree["eventID"].array(library="np")
         edep = tree["edepMeV"].array(library="np")
-        if method == "singles":
-            crystal_id = tree["crystalID"].array(library="np")
+        crystal_id = tree["crystalID"].array(library="np")
+    return event_id, edep, crystal_id
 
+
+def _addback_energies(event_id: np.ndarray, edep: np.ndarray) -> np.ndarray:
     if len(event_id) == 0:
         return np.array([], dtype=np.float64)
+    order = np.argsort(event_id, kind="stable")
+    eid_sorted = event_id[order]
+    edep_sorted = edep[order]
+    totals = np.add.reduceat(edep_sorted, np.r_[0, np.flatnonzero(np.diff(eid_sorted)) + 1])
+    return totals
 
-    if method == "addback":
-        order = np.argsort(event_id, kind="stable")
-        eid_sorted = event_id[order]
-        edep_sorted = edep[order]
-        totals = np.add.reduceat(edep_sorted, np.r_[0, np.flatnonzero(np.diff(eid_sorted)) + 1])
-        return totals
 
-    # singles: sum within (event, crystal), then take the max crystal per event
+def _singles_energies(event_id: np.ndarray, edep: np.ndarray, crystal_id: np.ndarray) -> np.ndarray:
+    if len(event_id) == 0:
+        return np.array([], dtype=np.float64)
+    # sum within (event, crystal), then take the max crystal per event
     key = event_id.astype(np.int64) * 1000 + crystal_id.astype(np.int64)  # crystalID is 1-30
     order = np.argsort(key, kind="stable")
     key_sorted = key[order]
@@ -98,6 +96,22 @@ def get_event_energies(root_path: str, method: str = "addback") -> np.ndarray:
     ev_ends = np.r_[ev_starts[1:], len(eid2_sorted)]
     singles = np.array([tot2_sorted[s:e].max() for s, e in zip(ev_starts, ev_ends)])
     return singles
+
+
+def get_event_energies(root_path: str, method: str = "addback") -> np.ndarray:
+    """Per-event total BGO energy deposit (MeV), one entry per event that
+    had >=1 hit (zero-hit events are not represented -- pad with the
+    known `n_total - len(result)` zeros yourself if you need every
+    simulated event, e.g. when histogramming for an efficiency-correct
+    spectrum -- `extract_spectrum` below does this).
+    """
+    if method not in ("addback", "singles"):
+        raise ValueError(f"method must be 'addback' or 'singles', got {method!r}")
+
+    event_id, edep, crystal_id = _read_bgo_hits(root_path)
+    if method == "addback":
+        return _addback_energies(event_id, edep)
+    return _singles_energies(event_id, edep, crystal_id)
 
 
 def extract_spectrum(
@@ -126,6 +140,38 @@ def extract_spectrum(
     counts = hist.astype(np.float64) / n_total
 
     return {"counts": counts, "edges": edges, "n_total": n_total, "n_hit": n_hit}
+
+
+def extract_both(
+    root_path: str,
+    run_log_path: str,
+    emin: float = 0.0,
+    emax: float = 10.0,
+    nbins: int = 500,
+) -> dict:
+    """Same as calling `extract_spectrum` for both methods, but with one
+    ROOT open and one run.log read shared between them -- halves the I/O
+    for callers (e.g. `build_dataset.py`) that always want both.
+    Returns {"addback": {...}, "singles": {...}}, each shaped like
+    `extract_spectrum`'s return value.
+    """
+    event_id, edep, crystal_id = _read_bgo_hits(root_path)
+    n_total = get_n_simulated_events(run_log_path)
+    edges = np.linspace(emin, emax, nbins + 1)
+
+    out = {}
+    for method, energies in (
+        ("addback", _addback_energies(event_id, edep)),
+        ("singles", _singles_energies(event_id, edep, crystal_id)),
+    ):
+        hist, _ = np.histogram(energies, bins=edges)
+        out[method] = {
+            "counts": hist.astype(np.float64) / n_total,
+            "edges": edges,
+            "n_total": n_total,
+            "n_hit": len(energies),
+        }
+    return out
 
 
 if __name__ == "__main__":
