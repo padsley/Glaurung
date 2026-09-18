@@ -5,16 +5,41 @@ implements). Escape peaks and lower-energy gammas' own continua are
 future phases, not attempted here.
 
 Every run's highest gamma (`E_top`) has a clean, uncontaminated energy
-window for its own Compton continuum: above the second-highest gamma's
-Compton edge (`gamma_physics.compton_edge_energy`), below `E_top`'s own
-photopeak, and with every companion gamma's own photopeak (which sits
-*above* its own Compton edge, not at it -- an easy mistake, see
+window for its own Compton continuum: above `BACKSCATTER_FLOOR_MEV` (see
+below) and the second-highest gamma's Compton edge
+(`gamma_physics.compton_edge_energy`), below `E_top`'s own photopeak,
+and with every companion gamma's own photopeak (which sits *above* its
+own Compton edge, not at it -- an easy mistake, see
 `clean_continuum_window`'s docstring) cut out of the middle if it falls
 inside that range. Within that window, `gamma_physics.klein_nishina_continuum_shape`
 matches the real (simulated) data well with just a single free
-amplitude -- confirmed by a throwaway visual check (4 widely-spaced test
-runs, amplitude-only least-squares fit) before writing this pipeline; no
-extra shape-correction parameters were needed.
+amplitude -- confirmed by a throwaway visual check (4 widely-spaced,
+high-E test runs, amplitude-only least-squares fit) before writing this
+pipeline; no extra shape-correction parameters were needed *there*.
+
+**`BACKSCATTER_FLOOR_MEV` (added 2026-09-18)**: adding the `"calib1g"`
+single-gamma calibration series (no companion gamma, so nothing was
+naturally excluding the low-energy end of the window) exposed a real,
+distinct feature around ~0.2-0.4 MeV -- a non-monotonic "dome" the raw
+Klein-Nishina shape does not predict (which is monotonic rising from
+T=0 to the edge), most likely photons Compton-scattering off
+surrounding/dead material before entering the sensitive crystal (a
+"backscatter peak", well known in gamma spectroscopy, physically
+distinct from a single in-crystal Compton scatter). Every *other*
+topology's window happened to already exclude this by construction
+(their companion gamma's own Compton edge almost always sits above it),
+which is why this was never noticed before -- but it can in principle
+contaminate any run whose natural lower bound falls below it too (a
+multi-gamma run with a small second-highest gamma), not just the new
+single-gamma series. Modeling this dome properly is out of scope here
+(a real future increment, not attempted); the fix for Phase 1 is simply
+to also exclude it via a fixed floor. Confirmed by a parameter sweep on
+several `calib1g` runs: chi2/ndf improves substantially going from
+`lo=0.03` to `lo~0.4-0.5` (e.g. 71.6->28.7 at E_top=1.0 MeV) but
+**does not reach the ~2-20 chi2/ndf typical at high E even past the
+dome** -- a real, honestly-reported residual limitation (likely
+multiple-in-crystal-scatter or other effects proportionally larger at
+low E), not something this floor claims to fully fix.
 
 This mirrors `fit_response_function.py`'s per-run-then-global structure
 exactly: local per-run fit -> per-energy measurement -> global
@@ -32,6 +57,7 @@ from gamma_physics import compton_edge_energy, klein_nishina_continuum_shape
 
 DATASET_PATH = "dataset.npz"
 RESPONSE_PATH = "response_function.npz"
+BACKSCATTER_FLOOR_MEV = 0.45
 
 
 def _resolution_sigma(E, doppler_k, intrinsic_k):
@@ -61,19 +87,23 @@ def clean_continuum_window(gammas, doppler_k, intrinsic_k, n_sigma=5.0, margin=0
     sits mid-window); raises `ValueError` if nothing usable survives
     (near-degenerate `E_top`/`E_2nd`, same failure mode already handled
     for photopeaks in `fit_response_function.py`).
+
+    **Zero-companion runs** (the `"calib1g"` single-gamma calibration
+    series, added 2026-09-18 specifically to reach true energies below
+    the ~2.35 MeV floor every multi-gamma topology is stuck above): there
+    is no `E_2nd` to set the lower bound, so the window simply starts
+    from `margin` (just above zero) instead -- the *entire* spectrum
+    below the photopeak is this one gamma's own uncontaminated response.
     """
     gammas = np.sort(np.asarray(gammas, dtype=np.float64))
     e_top = gammas[-1]
     companions = gammas[:-1]
-    if len(companions) == 0:
-        raise ValueError("run has no companion gamma to bound the continuum window")
-    e_2nd = companions[-1]
 
-    t_ce_2nd = compton_edge_energy(e_2nd)
     t_ce_top = compton_edge_energy(e_top)
     sigma_top = _resolution_sigma(e_top, doppler_k, intrinsic_k)
 
-    lo = t_ce_2nd + margin
+    lo = margin if len(companions) == 0 else compton_edge_energy(companions[-1]) + margin
+    lo = max(lo, BACKSCATTER_FLOOR_MEV)
     hi = min(t_ce_top, e_top - n_sigma * sigma_top) - margin
     if hi <= lo:
         raise ValueError(f"window empty/too narrow ({lo:.4f}, {hi:.4f}) MeV")

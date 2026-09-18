@@ -22,6 +22,17 @@ Four cascade topologies are combined by default (see `DEFAULT_TOPOLOGIES`):
   true ground.
 - `"3g_0+_2"` (`k39pg_40ca_cascade3g0p2/*.reaction`, 1431 runs, same event
   count, same date): the three-step analogue of `"0+_2"`.
+- `"calib1g"` (`k39pg_40ca_calib1g_*.reaction`, 25 runs, 50000 events
+  each, added 2026-09-18): single-gamma calibration sources, `Ex`
+  (hence the one gamma's energy) stepped 0.1-2.5 MeV in 0.1 MeV steps via
+  the same RECL-mass-excess-shift trick as `"0+_2"`, but with **no
+  intermediate level at all** -- one `BRAT -1 100.0 0` card sends the
+  resonance straight to this file's own fictional ground state, so every
+  event emits exactly one gamma, no companion. Exists specifically to
+  close the ~0.1-2.35 MeV gap in `fit_compton_continuum.py`'s "highest
+  gamma only" calibration (no run in the other four topologies has its
+  highest-energy gamma below ~2.35 MeV, since each shares a fixed total
+  `Ex` across 2 or 3 gammas) -- see README's "Compton continuum" section.
 
 The two- and three-gamma topologies do **not** share the same LEVL/BRAT
 structure (2 vs. 3 gammas per event, different `level(N)`/`br(P,Q)` keys),
@@ -62,6 +73,7 @@ DEFAULT_TOPOLOGIES = [
     ("0+_2", "k39pg_40ca_cascade0p2_*.reaction"),
     ("3g_ground", "k39pg_40ca_cascade3g/*.reaction"),
     ("3g_0+_2", "k39pg_40ca_cascade3g0p2/*.reaction"),
+    ("calib1g", "k39pg_40ca_calib1g_*.reaction"),
 ]
 
 

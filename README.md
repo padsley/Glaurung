@@ -19,12 +19,13 @@ does and doesn't cover) — real follow-on increments, not oversights.
 
 ## The dataset this pipeline consumes
 
-Four cascade topologies, all scans of the same ³⁹K(p,γ)⁴⁰Ca 606 keV
-resonance, combined into one 5401-run `dataset.npz` (see
-`build_dataset.py`'s `DEFAULT_TOPOLOGIES`). The first two are two-step
-(2-gamma) 1D scans; the last two, added 2026-09-15, are three-step
-(3-gamma) 2D grid scans (padsley's own specified topology, a second
-fictional level inserted above the first):
+Five topologies, all built on the same ³⁹K(p,γ)⁴⁰Ca 606 keV resonance,
+combined into one 5426-run `dataset.npz` (see `build_dataset.py`'s
+`DEFAULT_TOPOLOGIES`). The first two are two-step (2-gamma) 1D scans;
+the next two, added 2026-09-15, are three-step (3-gamma) 2D grid scans
+(padsley's own specified topology, a second fictional level inserted
+above the first); the fifth, added 2026-09-18, is a single-gamma
+calibration source (see "Compton continuum" below for why):
 
 - **`"ground"`** (added first): `~/data/Ancalagon_k39_results/k39pg_40ca_cascade_01_0100keV`
   ... `_88_8800keV`, 88 runs, 50000 events each. Terminates at 40Ca's true
@@ -51,6 +52,15 @@ fictional level inserted above the first):
 - **`"3g_0+_2"`** (`reactions/k39pg_40ca_cascade3g0p2/*.reaction`, 1431
   runs, 13000 events each): the 3-gamma analogue of `"0+_2"`, Level1 =
   0.1-5.3 MeV, Level2 = (Level1+0.1)-5.4 MeV above the 0+_2 state.
+- **`"calib1g"`** (`k39pg_40ca_calib1g_*.reaction`, 25 runs, 50000
+  events each, added 2026-09-18): **zero** intermediate levels — a
+  single `BRAT -1 100.0 0` card, so every event emits exactly one gamma,
+  no companion. `RECL` is shifted (same trick as `"0+_2"`, generalized:
+  `RECL(Ex) = -25.91223 - Ex`) so the single gamma's energy is whatever
+  `Ex` is chosen directly, stepped 0.1-2.5 MeV in 0.1 MeV steps. Exists
+  specifically to give `fit_compton_continuum.py` clean single-gamma
+  calibration data below the ~2.35 MeV floor every other topology is
+  stuck above — see "Compton continuum" below.
 
 All four topologies share the same generic structure (a single
 100%-branching decay path) — `parse_reaction.py`'s `cascades()` computes
@@ -148,7 +158,7 @@ free at the time; check `df -h /` before any further bulk regeneration.
 | `parse_reaction.py` | Parses Ancalagon `.reaction` files (`BEAM`/`TARG`/`RECL`/`ERES`/`LEVL`/`BRAT` cards) into level energies, branching, derived Q-value/Ex, and enumerates every resonance→ground cascade path with its energies and probability. Generalizes beyond the 2-level scan files (tested against the bundled `o15ag_19ne.reaction`, a real 4-level cascade). |
 | `extract_spectrum.py` | Per-event BGO spectrum from `dragon_hits.root` — `"addback"` or `"singles"` energy definition (see above), normalised by `n_total` (from `run.log`, since zero-hit events leave no row in the ROOT tree at all). `extract_both()` shares one ROOT open + one log read between both methods (halves I/O — matters at 5259 runs). |
 | `build_dataset.py` | Matches each configured topology's reaction files to their result directories by stem, runs both parsers, tags each row with its `topology`, saves the combined `dataset.npz`. `--merge-old PATH` falls back to a prior build's cached spectra for rows whose raw ROOT/log no longer exists (see "Disk-space note" above). |
-| `dataset.npz` | Built output, 5401 rows across 4 topologies (88 `"ground"`, 54 `"0+_2"`, 3828 `"3g_ground"`, 1431 `"3g_0+_2"`). `X` (5401, 9) — union of all topologies' feature keys (`br(-1,1)`, `br(-1,2)`, `br(1,0)`, `br(2,1)`, `eres`, `ex`, `level(1)`, `level(2)`, `q_value`), NaN where a topology doesn't have that key. `gamma_energies` (5401, 3) — sorted true gamma energies per run, NaN-padded (2 real values for the 2-gamma topologies). `Y_addback`/`Y_singles` (5401, 500) — normalised spectra; `edges` (501,) bin edges in MeV; `n_total`/`n_hit` (5401,) — simulated events / events with ≥1 BGO hit; `file_stems`/`topology` (5401,). |
+| `dataset.npz` | Built output, 5426 rows across 5 topologies (88 `"ground"`, 54 `"0+_2"`, 3828 `"3g_ground"`, 1431 `"3g_0+_2"`, 25 `"calib1g"`). `X` (5426, 10) — union of all topologies' feature keys (`br(-1,0)`, `br(-1,1)`, `br(-1,2)`, `br(1,0)`, `br(2,1)`, `eres`, `ex`, `level(1)`, `level(2)`, `q_value`), NaN where a topology doesn't have that key (`"calib1g"` has none of the `level(N)` keys at all — zero intermediate levels). `gamma_energies` (5426, 3) — sorted true gamma energies per run, NaN-padded (1 real value for `"calib1g"`, 2 for the other 2-gamma topologies). `Y_addback`/`Y_singles` (5426, 500) — normalised spectra; `edges` (501,) bin edges in MeV; `n_total`/`n_hit` (5426,) — simulated events / events with ≥1 BGO hit; `file_stems`/`topology` (5426,). |
 | `dataset_original_142.npz` | Frozen copy of the original 142-run (2-gamma-only) dataset, kept as the `--merge-old` cache since its raw ROOT/log files no longer exist on disk. |
 | `sanity_check_spectra.png` | Three example spectra (level = 0.5, 4.5, 8.5 MeV), addback vs. singles overlaid — used to visually confirm the pipeline (see "Verification" below). |
 | `fit_response_function.py` | For each run, fits every distinct known photopeak in `Y_singles` (local single-Gaussian fits if well-separated; a joint multi-Gaussian fit, generalized to however many of a run's peaks overlap — 2 or 3 for the 3-gamma topologies — for merged windows) → per-energy (sigma, **efficiency** — see "Efficiency curve fix" below) measurements → global fit of `sigma(E)^2 = (doppler_k*E)^2 + intrinsic_k^2*E`, plus `build_efficiency_curve`'s median-binned smoothing. Saves `response_function.npz`. |
@@ -460,18 +470,19 @@ differed most. Fixed (one line); held-out max dropped from 264% to
 believe the held-out numbers, not the plot, when they disagree with a
 "looks fine" impression.
 
-**A genuine, structural coverage gap, not a bug**: no run in this
-dataset has its highest-energy gamma below **~2.35 MeV** (confirmed
-empirically; the theoretical floor is `Ex/n_gammas` — the most-evenly-
-split case of a topology's total excitation energy across its 2 or 3
-gammas — about 1.86 MeV in the best case here, `~2.35` in practice once
-near-degenerate exclusions are accounted for). `compton_continuum`
-clips to the boundary value below that, same as `full_energy_efficiency`
-already does for its own range — **silently wrong, not just
-extrapolated**, for a hypothetical cascade whose own top gamma is
-genuinely below ~2.35 MeV. Resolving this needs Phase 2b (below), not a
-Phase-1 fix — it is fundamentally about a *lower* gamma's own continuum,
-which is exactly what Phase 1 deferred.
+**A genuine, structural coverage gap, not a bug (as first shipped
+2026-09-17)**: no run in the 4 cascade topologies has its highest-energy
+gamma below **~2.35 MeV** (the theoretical floor is `Ex/n_gammas` — the
+most-evenly-split case of a topology's total excitation energy across
+its 2 or 3 gammas — about 1.86 MeV in the best case, `~2.35` in practice
+once near-degenerate exclusions are accounted for). Below the curve's
+lowest point, `compton_continuum` clips to the boundary value, same as
+`full_energy_efficiency` does for its own range — **silently wrong, not
+just extrapolated**, for a hypothetical cascade whose own top gamma is
+genuinely below the floor. **Closed down to ~0.95 MeV the next day, see
+"New calibration data closes most of the gap" below** — this was
+originally scoped as "needs Phase 2b", but a much cheaper fix turned out
+to exist.
 
 **Visual confirmation** (`compton_continuum_prediction_check.png`): for
 2-gamma topology runs, the predicted spectrum (photopeaks + top-gamma
@@ -501,6 +512,74 @@ photopeak-only, exactly as documented (Phase 2b).
   different, typically much better resolution — expected, not a design
   flaw here.
 
+### New calibration data closes most of the gap (2026-09-18)
+
+padsley asked for simulation inputs specifically designed to overcome
+the ~2.35 MeV coverage floor above, to be run through Ancalagon. Rather
+than jumping straight to Phase 2b (peeling, real follow-on work — still
+not done), there was a cheaper option: a **dedicated single-gamma
+calibration source**, using the same `RECL` mass-excess-shift trick the
+`"0+_2"` topology already uses (shift the fictional final state so the
+compound's excitation above it is whatever energy you want), but with
+**no intermediate level at all** — a bare `BRAT -1 100.0 0` card sends
+the resonance straight to that fictional state, so every event emits
+**exactly one gamma**, at an energy chosen directly via
+`RECL(Ex_target) = BEAM_mass + TARG_mass - (Ex_target - ERES)`
+(`= -25.91223 - Ex_target` for this reaction; verified this formula
+exactly reproduces both existing series' `RECL` values before using it).
+No companion gamma at all means no exclusion window is needed — this is
+strictly cleaner calibration data than anything else in this project.
+
+- New topology **`"calib1g"`** (`k39pg_40ca_calib1g_*.reaction`, 25
+  runs, 0.1–2.5 MeV in 0.1 MeV steps, 50000 events/run): verified with
+  both `parse_reaction.py` (before running anything) and Ancalagon's own
+  `--reaction-stats` (100.00% single-gamma events) that each file
+  behaves as designed. Measured actual disk cost on a small (3000-event)
+  calibration run before committing to the full campaign (~0.64GB
+  conservative estimate vs. 7.1GB free at the time — disk stayed tight
+  all session); actual usage came in even lower, ~0.6GB.
+- `build_dataset.py` gained this topology (`DEFAULT_TOPOLOGIES`);
+  `dataset.npz` is now 5426 rows. `fit_compton_continuum.py`'s
+  `clean_continuum_window` needed a genuine fix, not just a config
+  change, for the zero-companion case (it previously required a
+  companion to set the window's lower bound at all).
+- **A real, previously-invisible physical feature found in the
+  process**: with no companion gamma to naturally push the window's
+  lower bound up, these runs' fits initially came back with much worse
+  chi2/ndf (40-290) than any multi-gamma run ever showed. A visual check
+  (not just trusting the number) revealed a genuine **non-monotonic
+  "dome"** around ~0.2-0.4 MeV that the (monotonically-rising)
+  Klein-Nishina shape does not predict — almost certainly a
+  **backscatter peak** (photons Compton-scattering off surrounding/dead
+  material before reaching the sensitive crystal, a well-known feature
+  in gamma spectroscopy, physically distinct from an in-crystal Compton
+  scatter). Every *other* topology's window had always started above
+  this by construction (their companion gamma's own Compton edge
+  usually sits higher) — this project had been implicitly relying on
+  that accident, not deliberately excluding the dome.
+- **Fix**: `BACKSCATTER_FLOOR_MEV = 0.45` — a fixed floor added to
+  `clean_continuum_window`'s lower bound, applied to *every* topology
+  (not just `"calib1g"`; a multi-gamma run with a small second-highest
+  gamma could in principle hit the same contamination). Chi2/ndf
+  improved substantially (e.g. 71.6→31.6 at E_top=1.0 MeV) but **does
+  not reach the ~2-20 typical at high E even past the dome** — reported
+  honestly as a real residual limitation (likely multiple in-crystal
+  scattering or other effects proportionally larger at low E), not
+  claimed as fully fixed. Modeling the dome itself is out of scope here.
+- **Result**: continuum curve coverage floor **2.35 MeV → 0.95 MeV**.
+  Below 0.95 MeV the window structurally collapses (a gamma's own
+  Compton edge sits below the 0.45 MeV dome floor once `E_top` gets
+  small enough — inverting `compton_edge_energy` shows this happens
+  below `E_top~0.63 MeV`, plus the photopeak-side margin shrinks it
+  further) — a now-understood, structural limit of this method, not an
+  arbitrary cutoff. Held-out validation unchanged/still
+  excellent after adding this data: median 2.1%, mean 3.1%, max 22.7%
+  (was 2.1%/3.0%/21.1%) — confirms the new low-E points that *do* pass
+  the quality cut integrate cleanly, not just add noise.
+- Reaching the remaining 0.1–0.9 MeV would need modeling the backscatter
+  dome itself (a new, real physics component, not a config tweak) —
+  genuine future work, not attempted here.
+
 ## Next steps
 
 1. ~~Fix the efficiency-curve interpolation issue~~ — **done 2026-09-17**,
@@ -521,10 +600,16 @@ photopeak-only, exactly as documented (Phase 2b).
    *not* the joint NNLS decomposition this item originally suggested
    (deliberately avoided — an all-at-once NNLS across a run's overlapping
    gammas would hit the same amplitude/width degeneracy just fixed for
-   photopeaks). Remaining: escape peaks, Compton edge sharpness, and
-   every gamma *except* each cascade's own highest-energy one — see that
-   section's "Follow-on phases" (2a/2b) for the concrete next steps and
-   why they're phased this way.
+   photopeaks). **2026-09-18**: added a dedicated `"calib1g"` single-gamma
+   simulation series that pushed the coverage floor from 2.35 MeV down to
+   0.95 MeV (see "New calibration data closes most of the gap") and, as a
+   side effect, discovered and corrected for a previously-invisible
+   backscatter-peak contamination affecting *every* topology's continuum
+   window, not just the new one. Remaining: escape peaks, Compton edge
+   sharpness, modeling the backscatter dome itself (would reach
+   0.1-0.95 MeV), and every gamma *except* each cascade's own
+   highest-energy one — see that section's "Follow-on phases" (2a/2b) for
+   the concrete next steps and why they're phased this way.
 3. **(Now the clearest single lever on the remaining held-out efficiency
    error, per the 2026-09-17 diagnosis)** Fix the low-energy (<~0.5 MeV)
    efficiency contamination from the near-zero spike. **padsley's
