@@ -9,10 +9,13 @@ legacy Geant3 code.
 this as a **response function vs. true gamma energy** (not a per-cascade
 regressor like the G3 project's `ParametricSpectrumEmulator`), and give it
 its own energy-dependent resolution model fit fresh from this data. All
-three are now done for the photopeak component — see "Response function
-results" below. Compton continuum / escape peaks are explicitly **not**
-modeled yet (see `response_function.py`'s docstring) — that's the next
-real increment, not an oversight.
+three are done for the photopeak component — see "Response function
+results" below. **Update (2026-09-17)**: the Compton continuum of each
+cascade's own highest-energy gamma is now modeled too (Phase 1 — see
+"Compton continuum" below); escape peaks, the Compton edge's sharpness,
+and every *other* gamma's own continuum are still not modeled (see
+`response_function.py`'s docstring for exactly what `predict_spectrum`
+does and doesn't cover) — real follow-on increments, not oversights.
 
 ## The dataset this pipeline consumes
 
@@ -149,11 +152,16 @@ free at the time; check `df -h /` before any further bulk regeneration.
 | `dataset_original_142.npz` | Frozen copy of the original 142-run (2-gamma-only) dataset, kept as the `--merge-old` cache since its raw ROOT/log files no longer exist on disk. |
 | `sanity_check_spectra.png` | Three example spectra (level = 0.5, 4.5, 8.5 MeV), addback vs. singles overlaid — used to visually confirm the pipeline (see "Verification" below). |
 | `fit_response_function.py` | For each run, fits every distinct known photopeak in `Y_singles` (local single-Gaussian fits if well-separated; a joint multi-Gaussian fit, generalized to however many of a run's peaks overlap — 2 or 3 for the 3-gamma topologies — for merged windows) → per-energy (sigma, **efficiency** — see "Efficiency curve fix" below) measurements → global fit of `sigma(E)^2 = (doppler_k*E)^2 + intrinsic_k^2*E`, plus `build_efficiency_curve`'s median-binned smoothing. Saves `response_function.npz`. |
-| `response_function.py` | `BgoResponseFunction` class: loads the fitted model, predicts photopeak position/width/efficiency at any true gamma energy (`full_energy_efficiency`, renamed 2026-09-17 from `full_energy_amplitude` — see below), and sums photopeaks over an arbitrary cascade's gamma list (`predict_spectrum`). Photopeak component only — see its own docstring. |
+| `response_function.py` | `BgoResponseFunction` class: loads the fitted model(s), predicts photopeak position/width/efficiency at any true gamma energy (`full_energy_efficiency`, renamed 2026-09-17 from `full_energy_amplitude` — see below), plus (new 2026-09-17) the Compton continuum of a cascade's own highest-energy gamma (`compton_continuum`). `predict_spectrum` sums photopeaks over an arbitrary cascade's gamma list plus that one continuum component — see its own docstring for exactly what is/isn't covered. |
 | `response_function_check.png` | Sigma-vs-energy and efficiency-vs-energy scatter plots with the fitted resolution curve / smoothed efficiency curve overlaid. |
 | `response_function_prediction_check.png` | `predict_spectrum` (using `validate_holdout.py`'s train-only fit) overlaid on one held-out run from each of the 4 topologies — confirms photopeak positions and widths are reproduced accurately, including the 3-peak-per-run topologies, on runs the fit never saw. |
 | `validate_holdout.py` | Proper train/held-out split: holds out every 5th run (~20%, spread across the whole `level(1)` grid), refits the resolution model + efficiency curve on the rest, checks both against the held-out runs — now reports both an ALL-held-out and a CLEAN-held-out efficiency error (see "Efficiency curve fix" below). See "Held-out validation" below. |
 | `holdout_validation.png` | Train vs. held-out sigma(E) points with the train-only fitted curve, sigma residuals, and (new 2026-09-17) held-out efficiency residuals/error-distribution split by clean vs. excluded points. |
+| `gamma_physics.py` | **Detector-agnostic** gamma-interaction physics (new 2026-09-17): `compton_edge_energy(E)`, `klein_nishina_continuum_shape(E, T)` (derived from first principles in its own docstring), `escape_peak_energies(E)` (not used yet). No dependency on Ancalagon/BGO/this repo's file formats — deliberately reusable by a future project (padsley has mentioned HPGe spectra). |
+| `fit_compton_continuum.py` | Phase 1 of Compton-continuum modeling (new 2026-09-17): for each run, finds the highest-energy gamma's own clean/uncontaminated continuum window (`clean_continuum_window`), fits a single amplitude against the raw Klein-Nishina shape, then the same median-binned-smoothing global curve as `build_efficiency_curve`. Saves `compton_continuum.npz`. See "Compton continuum" section below. |
+| `compton_continuum_check.png` | Fitted continuum amplitude vs. `E_top` (log scale) with the smoothed curve overlaid — visibly tight/clean compared to the efficiency curve's own scatter. |
+| `compton_continuum_prediction_check.png` | `predict_spectrum` (photopeaks + top-gamma continuum) overlaid on one held-out run from each of the 4 topologies — the real end-to-end shape check; green band marks each run's own fitted clean window. |
+| `validate_compton_holdout.py` | Same every-5th-run split as `validate_holdout.py` (imports its `split_stems` directly), refits the continuum curve train-only, checks against held-out runs. Saves `compton_continuum_holdout.npz`. |
 
 ## Usage
 
@@ -387,6 +395,112 @@ the 142-run-only version of this check are in git history / the
   the same reason as before (validate with a split, ship the full-data
   fit); only `validate_holdout.py`'s own run uses a train-only subset.
 
+## Compton continuum (Phase 1, 2026-09-17)
+
+padsley asked for the Compton-continuum modeling ("Next steps" item 2
+below, pre-fix) to be scoped out properly rather than shortcut, since a
+future project modeling HPGe spectra will need the same physics and will
+demand more precision. The approved plan phased this: model only each
+cascade's **highest-energy gamma's own continuum** first, since every
+run has a clean, uncontaminated window for it (no joint-fit degeneracy
+risk, unlike an NNLS decomposition across all a run's gammas at once);
+escape peaks and lower gammas' own continua are follow-on phases (items
+2a/2b below) once this scaffold and its validation harness exist.
+
+**Physics**: for a mono-energetic gamma of true energy `E`, Compton
+scattering deposits recoil-electron energy `T` in `[0, compton_edge_energy(E)]`,
+`compton_edge_energy(E) = 2*E^2/(m_e*c^2+2*E)` (`m_e*c^2=0.510999 MeV`,
+same constant the sibling G3 project's `emulator.py` uses for its own
+escape-peak formula). The differential shape vs. `T` was **derived from
+scratch** in `gamma_physics.klein_nishina_continuum_shape`'s own
+docstring (Klein-Nishina per solid angle, changed to a `T`-differential
+via the `cos(theta)->T` Jacobian) rather than taken on faith from a
+half-remembered reference — it reduces, after dropping energy-dependent-
+but-`T`-independent prefactors (irrelevant since a separate amplitude is
+always fit per energy against real data), to `E'/E + E/E' - sin^2(theta)`
+with `E'=E-T`, rising from 2 at `T=0` to `E'/E+E/E'>=2` at the edge — the
+characteristic upward "shoulder" real Compton continua show.
+
+**Validated against real data before building anything else**: a
+throwaway visual check (4 widely-spaced true energies, amplitude-only
+least-squares scale fit, no shape correction) confirmed this raw
+theoretical shape already matches this simulation's real `Y_singles`
+data closely in the clean window — no extra empirical shape-correction
+parameters were needed for Phase 1. That check also caught a real bug in
+the *window* logic before it reached the real pipeline: a companion
+gamma's own photopeak sits *above* its own Compton edge, not at it, so
+excluding only up to `compton_edge_energy(E_2nd)` still let `E_2nd`'s
+own peak leak into the "clean" region — fixed in
+`clean_continuum_window` by explicitly cutting out every companion's own
+`E_c +/- 5*sigma(E_c)` window too, not just bounding by the edge.
+
+**Fit results**: 4204/5401 runs fit successfully (failures are the same
+kind already seen for photopeaks — near-degenerate top-two gammas
+consuming the whole window — at a higher ~22% rate than photopeaks' 1.5%
+since a 3-gamma run has *two* companions that can each shrink the
+window). Held-out validation (same every-5th-run split as the
+photopeak/efficiency work, via `validate_compton_holdout.py`): relative
+difference median 2.1%, mean 3.0%, max 21.1% — **substantially tighter
+than the efficiency curve's own held-out numbers** (6.6%/13.6%/72.0%
+clean), because the continuum amplitude is a smooth, densely-and-
+redundantly-sampled quantity across the full energy range, unlike the
+efficiency curve's peakier, more topology-fragmented measurements.
+
+**A real bug caught by this validation, not just theory**: the first
+version of `measure_all_continuum` forgot to normalise the fitted
+amplitude by `n_total` (per-simulated-event), unlike every other
+measurement in this pipeline. This didn't show up as a fit failure — it
+produced a *smooth, plausible-looking* curve — but inflated `"0+_2"`
+topology (600,000 events/run) amplitudes ~40-50x relative to `"ground"`/
+`"3g_*"` (13,000-50,000 events/run) at the same true energy, which the
+held-out check caught immediately as a cluster of ~98% and one 264%
+outlier concentrated in exactly the runs the two curves' events counts
+differed most. Fixed (one line); held-out max dropped from 264% to
+21.1%. Lesson: a smooth-looking curve is not proof of correctness here —
+believe the held-out numbers, not the plot, when they disagree with a
+"looks fine" impression.
+
+**A genuine, structural coverage gap, not a bug**: no run in this
+dataset has its highest-energy gamma below **~2.35 MeV** (confirmed
+empirically; the theoretical floor is `Ex/n_gammas` — the most-evenly-
+split case of a topology's total excitation energy across its 2 or 3
+gammas — about 1.86 MeV in the best case here, `~2.35` in practice once
+near-degenerate exclusions are accounted for). `compton_continuum`
+clips to the boundary value below that, same as `full_energy_efficiency`
+already does for its own range — **silently wrong, not just
+extrapolated**, for a hypothetical cascade whose own top gamma is
+genuinely below ~2.35 MeV. Resolving this needs Phase 2b (below), not a
+Phase-1 fix — it is fundamentally about a *lower* gamma's own continuum,
+which is exactly what Phase 1 deferred.
+
+**Visual confirmation** (`compton_continuum_prediction_check.png`): for
+2-gamma topology runs, the predicted spectrum (photopeaks + top-gamma
+continuum) now visibly tracks the real "hump" between the two
+photopeaks that the old photopeak-only model showed as a flat zero. For
+3-gamma runs, only the region above the second-highest gamma is
+corrected this way — the gap between the two lower gammas is still
+photopeak-only, exactly as documented (Phase 2b).
+
+**Follow-on phases (not done here)**:
+- **Phase 2a — escape peaks** (`E > 1.022 MeV`): positions
+  (`gamma_physics.escape_peak_energies`) and the edge/continuum
+  machinery already exist; this is now mostly plumbing.
+- **Phase 2b — peel to lower gammas**: for each run, subtract the
+  already-fitted top gamma's full predicted response (photopeak +
+  continuum) from the raw spectrum, then fit the second-highest gamma's
+  own continuum in the now-cleaner residual (its own clean window, same
+  method); repeat down to the lowest gamma. Avoids the joint-fit
+  degeneracy an all-at-once NNLS decomposition would hit (the same
+  amplitude/width trade-off that was just fixed for photopeaks), because
+  each step only fits one new unknown against already-fixed, globally-
+  calibrated higher-energy components. This is also what would close the
+  ~2.35 MeV coverage gap above.
+- **HPGe reuse**: `gamma_physics.py` ports directly (zero
+  Ancalagon/BGO-specific code by design). The resolution model and the
+  fitted continuum-amplitude curve would need refitting for HPGe's very
+  different, typically much better resolution — expected, not a design
+  flaw here.
+
 ## Next steps
 
 1. ~~Fix the efficiency-curve interpolation issue~~ — **done 2026-09-17**,
@@ -400,20 +514,31 @@ the 142-run-only version of this check are in git history / the
    items 2-4 below (Compton/escape modeling, low-energy contamination,
    near-degenerate regions) remain open and dominate exactly the points
    this fix correctly declines to smooth over.
-2. Model the Compton continuum + escape peaks/Compton edge, most likely
-   via a joint NNLS-style decomposition across all runs simultaneously
-   (same spirit as the G3 project's approach, but here every basis
-   function's position is known analytically in advance, no PCA needed).
-   The much larger 3-gamma dataset should help constrain this further
-   than the 0+_2 topology alone would have.
-3. **(Now the clearest single lever on the remaining held-out error, per
-   the 2026-09-17 diagnosis)** Fix the low-energy (<~0.5 MeV) efficiency
-   contamination from the near-zero spike — confirmed via chi2/ndf (up
-   to ~140 for affected rows, vs. ~5-20 typical) that this is a real,
-   identifiable local-background-model failure, not just noise, and it's
-   responsible for several of the single worst held-out points found
-   2026-09-17 (e.g. `k39pg_40ca_cascade3g_L1-0200keV_L2-4000keV` at
-   E=0.2 MeV, chi2/ndf=141, off by 385%).
+2. ~~Model the Compton continuum~~ — **Phase 1 done 2026-09-17** (the
+   highest-energy gamma's own continuum only), see "Compton continuum"
+   above — a response-function-style fit (physics-derived Klein-Nishina
+   shape, single fitted amplitude per energy, median-binned smoothing),
+   *not* the joint NNLS decomposition this item originally suggested
+   (deliberately avoided — an all-at-once NNLS across a run's overlapping
+   gammas would hit the same amplitude/width degeneracy just fixed for
+   photopeaks). Remaining: escape peaks, Compton edge sharpness, and
+   every gamma *except* each cascade's own highest-energy one — see that
+   section's "Follow-on phases" (2a/2b) for the concrete next steps and
+   why they're phased this way.
+3. **(Now the clearest single lever on the remaining held-out efficiency
+   error, per the 2026-09-17 diagnosis)** Fix the low-energy (<~0.5 MeV)
+   efficiency contamination from the near-zero spike. **padsley's
+   diagnosis (2026-09-17): this is an electronics artefact and belongs
+   suppressed at the source, in Ancalagon's simulation** (a threshold or
+   noise model matching the real BGO electronics), **not patched further
+   in this analysis pipeline** — don't respond to this item by tightening
+   more cuts/thresholds in `build_efficiency_curve`/`measure_all_peaks`.
+   Confirmed via chi2/ndf (up to ~140 for affected rows, vs. ~5-20
+   typical) that this is a real, identifiable local-background-model
+   failure, not just noise, and it's responsible for several of the
+   single worst held-out points found 2026-09-17 (e.g.
+   `k39pg_40ca_cascade3g_L1-0200keV_L2-4000keV` at E=0.2 MeV,
+   chi2/ndf=141, off by 385%).
 4. Investigate/improve the near-degenerate region in each topology (each
    has its own, at a different absolute energy — see above) — wider or
    better-conditioned joint fits, or a parameterization that doesn't
