@@ -1,29 +1,30 @@
 """Held-out validation of the response-function fit in
 `fit_response_function.py`.
 
-The original `fit_all()` fits `doppler_k`/`intrinsic_k` (the resolution
-model) and the efficiency interpolation curve on **all 88 runs at once** --
-there was no train/test split, so the earlier "prediction check" plot
-(`response_function_prediction_check.png`) only showed the model
-reproducing runs it had itself been fit on. This script redoes the fit
-properly: hold out every 5th run on the `level(1)` grid (~20%, spread
-across the full 0.1-8.8 MeV range to test interpolation, not
-extrapolation), fit the resolution model and efficiency curve on the
-remaining ~80% only, then check both against the held-out runs the fit
-never saw.
+Unlike the earlier version of this script, this does **not** re-run the
+expensive per-peak fits (`measure_all_peaks`) -- it loads the already-
+computed stage-3 rows from `peak_measurements.npz` (`fit_all`'s cache,
+shared with `fit_compton_continuum.py`) and only redoes the fast
+train/holdout aggregation on top of them: hold out every 5th run (~20%,
+spread across the full grid to test interpolation, not extrapolation),
+fit `intrinsic_k` and the efficiency curve on the remaining ~80% only,
+then check both against the held-out runs those two fits never saw.
 
-Each run's own per-peak fit (position/width/amplitude at its two known
-gamma energies) is independent of every other run, so that step is
-unaffected by the split -- only the *global* 2-parameter resolution model
-and the efficiency interpolation are refit train-only here.
+**Simplification, disclosed** (see `fit_response_function.py`'s module
+docstring for the full reasoning): `beta` itself is *not* re-derived
+train-only here -- it was already estimated from all rows when
+`peak_measurements.npz` was built, and as a single global scalar
+overdetermined by thousands of window measurements, the leakage from
+that is expected to be negligible. Only `intrinsic_k` and the efficiency
+curve get a genuine held-out check.
 """
 from __future__ import annotations
 
 import numpy as np
 
 from fit_response_function import (
-    DATASET_PATH, _resolution_model, build_efficiency_curve,
-    fit_resolution_model, measure_all_peaks,
+    DATASET_PATH, ROW_FIELDS, STAGE_ROWS_PATH, RESPONSE_PATH,
+    _intrinsic_model, build_efficiency_curve, fit_intrinsic_k, load_stage_rows,
 )
 
 
@@ -36,8 +37,10 @@ def split_stems(all_stems, every_n=5, offset=4):
     return train, holdout
 
 
-def run_validation(dataset_path=DATASET_PATH, every_n=5, offset=4, sigma_rel_err_max=0.5):
-    rows = measure_all_peaks(dataset_path, verbose=False)
+def run_validation(stage_rows_path=STAGE_ROWS_PATH, response_path=RESPONSE_PATH,
+                    every_n=5, offset=4, sigma_rel_err_max=0.5):
+    rows = load_stage_rows(stage_rows_path, ROW_FIELDS)
+    beta = float(np.load(response_path)["beta"])
     all_stems = [r["stem"] for r in rows]
     train_stems, holdout_stems = split_stems(all_stems, every_n=every_n, offset=offset)
     print(f"{len(train_stems)} train runs, {len(holdout_stems)} held-out runs "
@@ -47,31 +50,28 @@ def run_validation(dataset_path=DATASET_PATH, every_n=5, offset=4, sigma_rel_err
     train_rows = [r for r in rows if r["stem"] in train_stems]
     holdout_rows = [r for r in rows if r["stem"] in holdout_stems]
 
-    # --- resolution model: fit on train only ---
-    doppler_k, intrinsic_k, dk_err, ik_err, train_good, train_chi2 = fit_resolution_model(
+    # --- intrinsic-width model: fit on train only (beta is fixed, see module docstring) ---
+    intrinsic_k, ik_err, train_good, train_chi2 = fit_intrinsic_k(
         train_rows, sigma_rel_err_max=sigma_rel_err_max)
-    print(f"\n[trained on {len(train_rows)} train rows]")
-    print(f"doppler_k = {doppler_k:.5f} +/- {dk_err:.5f}, intrinsic_k = {intrinsic_k:.5f} +/- {ik_err:.5f}")
+    print(f"\n[trained on {len(train_rows)} train rows; beta={beta:.5f} fixed, from all rows]")
+    print(f"intrinsic_k = {intrinsic_k:.5f} +/- {ik_err:.5f}")
     print(f"train chi2/ndf (fit on train, evaluated on train) = {train_chi2:.2f}")
 
     ho_energy = np.array([r["energy"] for r in holdout_rows])
-    ho_sigma = np.array([r["sigma"] for r in holdout_rows])
-    ho_sigma_err = np.array([r["sigma_err"] for r in holdout_rows])
-    ho_rel_err = np.array([r["sigma_rel_err"] for r in holdout_rows])
-    ho_good = np.isfinite(ho_rel_err) & (ho_rel_err < sigma_rel_err_max) & (ho_sigma > 0.002)
+    ho_sigma = np.array([r["sigma_intrinsic"] for r in holdout_rows])
+    ho_sigma_err = np.array([r["sigma_intrinsic_err"] for r in holdout_rows])
+    ho_rel_err = np.array([r["sigma_intrinsic_rel_err"] for r in holdout_rows])
+    ho_good = np.isfinite(ho_rel_err) & (ho_rel_err < sigma_rel_err_max) & (ho_sigma > 0.0005) & (ho_sigma_err > 1e-4)
 
-    ho_pred = _resolution_model(ho_energy[ho_good], doppler_k, intrinsic_k)
+    ho_pred = _intrinsic_model(ho_energy[ho_good], intrinsic_k)
     ho_resid = (ho_sigma[ho_good] - ho_pred) / ho_sigma_err[ho_good]
-    ho_chi2 = float(np.sum(ho_resid**2) / max(ho_good.sum() - 2, 1))
+    ho_chi2 = float(np.sum(ho_resid**2) / max(ho_good.sum() - 1, 1))
     ho_rel_diff = (ho_sigma[ho_good] - ho_pred) / ho_sigma[ho_good]
     print(f"HELD-OUT chi2/ndf (fit on train, evaluated on {ho_good.sum()} held-out points) = {ho_chi2:.2f}")
-    print(f"HELD-OUT sigma relative difference: median={np.median(np.abs(ho_rel_diff)) * 100:.1f}%, "
+    print(f"HELD-OUT sigma_intrinsic relative difference: median={np.median(np.abs(ho_rel_diff)) * 100:.1f}%, "
           f"mean={np.mean(np.abs(ho_rel_diff)) * 100:.1f}%, max={np.max(np.abs(ho_rel_diff)) * 100:.1f}%")
 
     # --- efficiency curve: build interpolation on train only ---
-    # NOTE: held out on *efficiency* (amplitude*sigma*sqrt(2pi)/bin_width,
-    # a resolution-independent peak area), not raw peak-height amplitude
-    # -- see fit_response_function.py's measure_all_peaks docstring for why.
     eff_energy, eff_curve = build_efficiency_curve(train_rows, sigma_rel_err_max=sigma_rel_err_max)
     ho_eff = np.array([r["efficiency"] for r in holdout_rows])
     ho_eff_pred = np.interp(ho_energy[ho_good], eff_energy, eff_curve)
@@ -90,7 +90,7 @@ def run_validation(dataset_path=DATASET_PATH, every_n=5, offset=4, sigma_rel_err
     ho_joint = np.array([r["joint"] for r in holdout_rows])[ho_good]
     ho_mult = np.array([r["multiplicity"] for r in holdout_rows])[ho_good]
     ho_chi2ndf = np.array([r["chi2_ndf"] for r in holdout_rows])[ho_good]
-    ho_clean = ~ho_joint & (ho_mult == 1) & (ho_chi2ndf < 50.0)
+    ho_clean = ~ho_joint & (ho_mult == 1) & (ho_chi2ndf < 15.0)
     clean_rel_diff = ho_eff_rel_diff[ho_clean]
     print(f"HELD-OUT efficiency relative difference (CLEAN {ho_clean.sum()} of those, excluding "
           f"joint/coincident/high-chi2 held-out points): "
@@ -98,11 +98,10 @@ def run_validation(dataset_path=DATASET_PATH, every_n=5, offset=4, sigma_rel_err
           f"mean={np.mean(np.abs(clean_rel_diff)) * 100:.1f}%, max={np.max(np.abs(clean_rel_diff)) * 100:.1f}%")
 
     return {
-        "train_rows": train_rows, "holdout_rows": holdout_rows,
-        "doppler_k": doppler_k, "intrinsic_k": intrinsic_k,
+        "beta": beta, "intrinsic_k": intrinsic_k,
         "train_chi2_ndf": train_chi2, "holdout_chi2_ndf": ho_chi2,
-        "holdout_energy": ho_energy[ho_good], "holdout_sigma": ho_sigma[ho_good],
-        "holdout_sigma_pred": ho_pred, "holdout_sigma_rel_diff": ho_rel_diff,
+        "holdout_energy": ho_energy[ho_good], "holdout_sigma_intrinsic": ho_sigma[ho_good],
+        "holdout_sigma_intrinsic_pred": ho_pred, "holdout_sigma_intrinsic_rel_diff": ho_rel_diff,
         "holdout_efficiency": ho_eff[ho_good], "holdout_efficiency_pred": ho_eff_pred,
         "holdout_efficiency_rel_diff": ho_eff_rel_diff, "holdout_efficiency_clean_mask": ho_clean,
         "eff_energy": eff_energy, "eff_curve": eff_curve,
@@ -113,12 +112,13 @@ if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--dataset", default=DATASET_PATH)
+    ap.add_argument("--stage-rows", default=STAGE_ROWS_PATH)
+    ap.add_argument("--response", default=RESPONSE_PATH)
     ap.add_argument("--every-n", type=int, default=5)
     ap.add_argument("--offset", type=int, default=4)
     ap.add_argument("--out", default="holdout_validation.npz")
     args = ap.parse_args()
 
-    result = run_validation(args.dataset, every_n=args.every_n, offset=args.offset)
-    np.savez(args.out, **{k: v for k, v in result.items() if k not in ("train_rows", "holdout_rows")})
+    result = run_validation(args.stage_rows, args.response, every_n=args.every_n, offset=args.offset)
+    np.savez(args.out, **result)
     print(f"\nSaved {args.out}")

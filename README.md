@@ -16,6 +16,11 @@ cascade's own highest-energy gamma is now modeled too (Phase 1 — see
 and every *other* gamma's own continuum are still not modeled (see
 `response_function.py`'s docstring for exactly what `predict_spectrum`
 does and doesn't cover) — real follow-on increments, not oversights.
+**Update (2026-09-19)**: photopeaks are now fit with a physically-derived
+Doppler-broadened lineshape, not a Gaussian (real chi2/ndf 536→225 on an
+isolated high-statistics peak — see "Doppler-broadened lineshape +
+backscatter-dome model" below), and the backscatter dome found
+2026-09-18 is modeled (not just excluded), though still data-starved.
 
 ## The dataset this pipeline consumes
 
@@ -161,17 +166,19 @@ free at the time; check `df -h /` before any further bulk regeneration.
 | `dataset.npz` | Built output, 5426 rows across 5 topologies (88 `"ground"`, 54 `"0+_2"`, 3828 `"3g_ground"`, 1431 `"3g_0+_2"`, 25 `"calib1g"`). `X` (5426, 10) — union of all topologies' feature keys (`br(-1,0)`, `br(-1,1)`, `br(-1,2)`, `br(1,0)`, `br(2,1)`, `eres`, `ex`, `level(1)`, `level(2)`, `q_value`), NaN where a topology doesn't have that key (`"calib1g"` has none of the `level(N)` keys at all — zero intermediate levels). `gamma_energies` (5426, 3) — sorted true gamma energies per run, NaN-padded (1 real value for `"calib1g"`, 2 for the other 2-gamma topologies). `Y_addback`/`Y_singles` (5426, 500) — normalised spectra; `edges` (501,) bin edges in MeV; `n_total`/`n_hit` (5426,) — simulated events / events with ≥1 BGO hit; `file_stems`/`topology` (5426,). |
 | `dataset_original_142.npz` | Frozen copy of the original 142-run (2-gamma-only) dataset, kept as the `--merge-old` cache since its raw ROOT/log files no longer exist on disk. |
 | `sanity_check_spectra.png` | Three example spectra (level = 0.5, 4.5, 8.5 MeV), addback vs. singles overlaid — used to visually confirm the pipeline (see "Verification" below). |
-| `fit_response_function.py` | For each run, fits every distinct known photopeak in `Y_singles` (local single-Gaussian fits if well-separated; a joint multi-Gaussian fit, generalized to however many of a run's peaks overlap — 2 or 3 for the 3-gamma topologies — for merged windows) → per-energy (sigma, **efficiency** — see "Efficiency curve fix" below) measurements → global fit of `sigma(E)^2 = (doppler_k*E)^2 + intrinsic_k^2*E`, plus `build_efficiency_curve`'s median-binned smoothing. Saves `response_function.npz`. |
-| `response_function.py` | `BgoResponseFunction` class: loads the fitted model(s), predicts photopeak position/width/efficiency at any true gamma energy (`full_energy_efficiency`, renamed 2026-09-17 from `full_energy_amplitude` — see below), plus (new 2026-09-17) the Compton continuum of a cascade's own highest-energy gamma (`compton_continuum`). `predict_spectrum` sums photopeaks over an arbitrary cascade's gamma list plus that one continuum component — see its own docstring for exactly what is/isn't covered. |
-| `response_function_check.png` | Sigma-vs-energy and efficiency-vs-energy scatter plots with the fitted resolution curve / smoothed efficiency curve overlaid. |
-| `response_function_prediction_check.png` | `predict_spectrum` (using `validate_holdout.py`'s train-only fit) overlaid on one held-out run from each of the 4 topologies — confirms photopeak positions and widths are reproduced accurately, including the 3-peak-per-run topologies, on runs the fit never saw. |
-| `validate_holdout.py` | Proper train/held-out split: holds out every 5th run (~20%, spread across the whole `level(1)` grid), refits the resolution model + efficiency curve on the rest, checks both against the held-out runs — now reports both an ALL-held-out and a CLEAN-held-out efficiency error (see "Efficiency curve fix" below). See "Held-out validation" below. |
-| `holdout_validation.png` | Train vs. held-out sigma(E) points with the train-only fitted curve, sigma residuals, and (new 2026-09-17) held-out efficiency residuals/error-distribution split by clean vs. excluded points. |
-| `gamma_physics.py` | **Detector-agnostic** gamma-interaction physics (new 2026-09-17): `compton_edge_energy(E)`, `klein_nishina_continuum_shape(E, T)` (derived from first principles in its own docstring), `escape_peak_energies(E)` (not used yet). No dependency on Ancalagon/BGO/this repo's file formats — deliberately reusable by a future project (padsley has mentioned HPGe spectra). |
-| `fit_compton_continuum.py` | Phase 1 of Compton-continuum modeling (new 2026-09-17): for each run, finds the highest-energy gamma's own clean/uncontaminated continuum window (`clean_continuum_window`), fits a single amplitude against the raw Klein-Nishina shape, then the same median-binned-smoothing global curve as `build_efficiency_curve`. Saves `compton_continuum.npz`. See "Compton continuum" section below. |
-| `compton_continuum_check.png` | Fitted continuum amplitude vs. `E_top` (log scale) with the smoothed curve overlaid — visibly tight/clean compared to the efficiency curve's own scatter. |
-| `compton_continuum_prediction_check.png` | `predict_spectrum` (photopeaks + top-gamma continuum) overlaid on one held-out run from each of the 4 topologies — the real end-to-end shape check; green band marks each run's own fitted clean window. |
-| `validate_compton_holdout.py` | Same every-5th-run split as `validate_holdout.py` (imports its `split_stems` directly), refits the continuum curve train-only, checks against held-out runs. Saves `compton_continuum_holdout.npz`. |
+| `fit_response_function.py` | For each run, fits every distinct known photopeak in `Y_singles` with a **Doppler-broadened lineshape** (new 2026-09-19, `gamma_physics.doppler_lineshape` — was a Gaussian; local single-peak fits if well-separated, a joint multi-peak fit for merged windows, generalized to however many of a run's peaks overlap) → a **staged fit**: free-`beta` local fits → robust global `beta` → fixed-`beta` refit → global `sigma_intrinsic(E)=intrinsic_k*sqrt(E)`, plus `build_efficiency_curve`'s median-binned smoothing. Saves `response_function.npz` and caches per-peak measurements to `peak_measurements.npz` (shared with `validate_holdout.py`/`fit_compton_continuum.py`, which no longer re-run this expensive step themselves). |
+| `peak_measurements.npz` | Cached stage-3 (fixed-`beta`) per-peak measurements (new 2026-09-19) — one row per distinct photopeak: `energy`, `sigma_intrinsic(_err)`, `amplitude(_err)`, `efficiency`, `chi2_ndf`, `joint`, `multiplicity`. Loaded by `fit_response_function.save_stage_rows`/`load_stage_rows`. |
+| `response_function.py` | `BgoResponseFunction` class: loads the fitted model(s), predicts photopeak position/width/efficiency at any true gamma energy (`full_energy_efficiency`; `photopeak()` uses the Doppler lineshape, not a Gaussian, as of 2026-09-19 — stores `beta`/`intrinsic_k`, not `doppler_k`/`intrinsic_k`), plus (2026-09-17) the Compton continuum and (2026-09-19) backscatter dome of a cascade's own highest-energy gamma. `predict_spectrum` sums photopeaks over an arbitrary cascade's gamma list plus that one continuum+dome contribution — see its own docstring for exactly what is/isn't covered. |
+| `lineshape_check.png` | New 2026-09-19: a real isolated high-statistics photopeak with a Gaussian fit and a Doppler-lineshape fit overlaid (chi2/ndf 536 vs. 225) — the direct visual case for the lineshape switch. |
+| `response_function_check.png` | Doppler-lineshape components (Doppler box, intrinsic, total effective sigma) vs. energy, and efficiency-vs-energy scatter with the smoothed efficiency curve overlaid. |
+| `response_function_prediction_check.png` | `predict_spectrum` (using `validate_holdout.py`'s train-only fit) overlaid on one held-out run from each of 4 topologies — confirms photopeak positions/shapes (now visibly flat-topped, not bell-curved) are reproduced accurately on runs the fit never saw. |
+| `validate_holdout.py` | Loads cached `peak_measurements.npz` (no expensive re-fit, 2026-09-19) and does the (fast) train/holdout aggregation: holds out every 5th run (~20%), refits `intrinsic_k` + efficiency curve on the rest (`beta` itself is not re-derived train-only, a disclosed simplification — see "Doppler-broadened lineshape" section), checks both against held-out runs. See "Held-out validation" below. |
+| `holdout_validation.png` | Held-out efficiency residuals and `\|error\|` distribution, split by clean vs. excluded points. |
+| `gamma_physics.py` | **Detector-agnostic** gamma-interaction physics: `compton_edge_energy(E)`, `klein_nishina_continuum_shape(E, T)`, `doppler_lineshape(E, x, beta, sigma_intrinsic)` and `effective_sigma(...)` (new 2026-09-19, both derived from first principles in their own docstrings), `backscatter_energy(E)` (new 2026-09-19), `escape_peak_energies(E)` (not used yet). No dependency on Ancalagon/BGO/this repo's file formats — deliberately reusable by a future project (padsley has mentioned HPGe spectra). |
+| `fit_compton_continuum.py` | For each run, finds the highest-energy gamma's own clean/uncontaminated continuum window (`clean_continuum_window`), fits a continuum amplitude against the raw Klein-Nishina shape **plus (new 2026-09-19) a backscatter-dome Gaussian bump** (physics-anchored center, fit amplitude/width) whenever the window covers that region, then the same median-binned-smoothing global curve as `build_efficiency_curve` for both. Saves `compton_continuum.npz`. See "Compton continuum" and "Doppler-broadened lineshape" sections below. |
+| `compton_continuum_check.png` | Fitted continuum amplitude vs. `E_top` (log scale) with the smoothed curve overlaid, plus (new 2026-09-19) the sparse backscatter-dome amplitude curve. |
+| `compton_continuum_prediction_check.png` | Zoom-in (0-1.2 MeV) on two held-out runs showing the predicted backscatter dome (new 2026-09-19) against real data, with the physics-predicted dome center marked. |
+| `validate_compton_holdout.py` | Same every-5th-run split as `validate_holdout.py` (imports its `split_stems` directly), refits the continuum **and dome** curves train-only, checks both against held-out runs. Saves `compton_continuum_holdout.npz`. |
 
 ## Usage
 
@@ -381,6 +388,12 @@ splittable this way since the old code didn't track it).
 
 ## Held-out validation
 
+**Superseded 2026-09-19** by the Doppler-lineshape switch — see "Doppler-
+broadened lineshape + backscatter-dome model" below for current numbers
+(`beta`/`intrinsic_k` replace `doppler_k`/`intrinsic_k`, and the
+efficiency curve's `chi2_ndf_max` changed from 50 to 15). Kept below as
+the historical record of the pre-Doppler (Gaussian-lineshape) state.
+
 `validate_holdout.py` holds out every 5th run across the *combined*
 5401-run dataset (1064 runs / 3019 peak measurements passing the quality
 cut), refits on the remaining ~79%, checks both the resolution model and
@@ -580,6 +593,145 @@ strictly cleaner calibration data than anything else in this project.
   dome itself (a new, real physics component, not a config tweak) —
   genuine future work, not attempted here.
 
+## Doppler-broadened lineshape + backscatter-dome model (2026-09-19)
+
+padsley reviewed the visual validation report and pointed out that real
+peak shapes don't look Gaussian, and asked for (1) a proper
+Doppler-broadened lineshape and (2) the backscatter dome modeled, not
+just excluded. Both landed as one combined change, since the dome's own
+window logic depends on the resolution model.
+
+**The physics, checked against real data before writing any fitting
+code**: for a gamma emitted in flight by a recoil at velocity fraction
+`beta`, isotropic emission into a near-4π array gives a *uniform*
+density of Doppler-shifted true energies between `E*(1-beta)` and
+`E*(1+beta)` (a "box"), not a bell curve — the old
+`sigma(E)^2=(doppler_k*E)^2+intrinsic_k^2*E` model was always an
+empirical proxy for this, just folded into a single Gaussian width
+instead of modeled as its own component. Pulled an isolated,
+high-statistics real peak (E=5.4 MeV, 600000-event `"0+_2"` run) and fit
+it both ways before committing to anything: **Gaussian chi2/ndf=536,
+Doppler-box-convolved-with-Gaussian chi2/ndf=225** — see
+`lineshape_check.png`, which shows the real data's characteristic
+flat-topped, steep-sided shape that no Gaussian can reproduce. `beta`
+(the recoil velocity fraction) came out at 0.0318, physically sensible
+and — since every cascade here is "instantaneous at vertex" (no time for
+the recoil to decelerate between gammas) — expected to be one true
+constant shared by *every* gamma in *every* run, not an energy-dependent
+curve like the old model's Doppler term.
+
+**New physics in `gamma_physics.py`**: `doppler_lineshape(E, x, beta,
+sigma_intrinsic)` (the closed-form box-convolved-Gaussian, derived from
+scratch in its own docstring), `effective_sigma(E, beta, sigma_intrinsic)`
+(a variance-equivalent single-number width for window-sizing callers
+only, not a claim the lineshape is Gaussian), `backscatter_energy(E)`
+(the dome's physics-predicted center, `E - compton_edge_energy(E)`).
+
+**Staged fit in `fit_response_function.py`** (`beta` is one global
+constant, so it can't be fit per-peak like `sigma` could): (1) local
+fits with `beta` free per window → (2) robust (median) global `beta`
+from thousands of windows → (3) refit every peak with `beta` fixed,
+`(amplitude, sigma_intrinsic)` free → (4) global
+`sigma_intrinsic(E)=intrinsic_k*sqrt(E)` fit. Stage-3 rows are now
+cached (`peak_measurements.npz`) and shared with `validate_holdout.py`/
+`fit_compton_continuum.py`, which no longer re-run the expensive fit
+themselves — **disclosed simplification**: `beta` is derived from *all*
+rows (not re-derived train-only) even during held-out validation, since
+as a single scalar overdetermined by thousands of independent windows
+the leakage from that is expected to be negligible; `intrinsic_k` and
+the efficiency curve still get a genuine train/holdout split.
+
+**Two real bugs caught before trusting the full-dataset run, not after**:
+1. **Performance**: the fixed-`beta` refit stage first measured at
+   1.94s/window (default `scipy.optimize.curve_fit` tolerances) — at
+   ~9000 windows, a ~4.9 hour run. Root cause: with `beta` fixed,
+   `sigma_intrinsic`'s effect on chi2 is often nearly flat (whenever the
+   Doppler box already dominates the total width), so the optimizer took
+   hundreds of tiny steps chasing default-tight (~1e-8) convergence on a
+   direction that barely mattered for a value later aggregated over
+   thousands of measurements anyway. Loosening `xtol`/`ftol`/`gtol` to
+   1e-6 and `maxfev` to 10000 cut this to 0.069s/window — a 28x speedup,
+   full run down to ~23 minutes, with no loss in the aggregate result.
+2. **Boundary pinning**: `sigma_intrinsic` hitting its lower fit bound
+   produced degenerate, artificially-tiny reported uncertainties that
+   both trivially passed the existing `rel_err<0.5` quality cut *and*
+   (via division by that tiny error) blew `intrinsic_k`'s chi2/ndf up to
+   ~5e20 in an early smoke test. Fixed with a much more permissive lower
+   bound (1e-5, so a fit genuinely wanting near-zero intrinsic width is
+   free to go there) plus an explicit `sigma_intrinsic_err > 1e-4 MeV`
+   guard in every downstream quality cut — the same "watch for a fit
+   landing exactly on a bound" lesson the sibling G3 project had already
+   learned, re-learned here the hard way instead of remembered.
+
+**Results** (full 5426-run dataset): `beta=0.03188` (from 5057/13381
+windows), `intrinsic_k=0.00380`. Held-out checks (`validate_holdout.py`):
+
+- **Total effective width** (`beta` + `intrinsic_k` combined — the
+  number that actually matters for peak width in practice): median
+  0.7%, mean 2.2%, max 82.9% — dramatically tighter than the old
+  Gaussian model's sigma check (5.5%/9.0%/73.9%), because the dominant
+  Doppler component is now a single, extremely well-determined global
+  constant rather than a per-energy curve fit.
+- **`sigma_intrinsic` alone**: median 38.6%, mean 53.0% — much noisier
+  in *relative* terms, reported honestly rather than hidden: it's now a
+  small residual correction (a few-to-20 keV) measured against typical
+  per-run statistics of 13000-50000 events, not the dominant width
+  term it used to be blended into.
+- **Efficiency (CLEAN)**: median 3.7%, mean 10.8%, max 88.7% — median
+  and mean *both* improved over the pre-Doppler-lineshape baseline
+  (6.6%/13.6%/72.0%); max is close to, not better than, before. Getting
+  here needed a second fix, below.
+
+**A third bug, caught by exactly this held-out check**: initially the
+efficiency curve's `chi2_ndf_max=50` cutoff (unchanged from the old
+Gaussian model) let through a cluster of badly-fit, systematically-
+low-amplitude `"3g_0+_2"` peaks sitting right at chi2/ndf~40-50 —
+inflating held-out max efficiency error to 305%. The new lineshape fits
+chi2/ndf much tighter overall (most clean fits land at 2-10 now, not the
+old model's 2-20), so a threshold tuned for the noisier old model was no
+longer doing its job. Swept `chi2_ndf_max` in {10, 15, 20, 50} against
+the held-out split (cheap — reused the cached stage-3 rows, no refit
+needed); **15 gave the best median/mean and cut max to 88.7%**, back in
+line with the pre-Doppler baseline. Now the default everywhere this
+matters (`build_efficiency_curve`, `fit_all`'s diagnostics,
+`validate_holdout.py`'s CLEAN split).
+
+**Backscatter dome**: modeled instead of excluded, per padsley's
+request. `fit_compton_continuum.py`'s `clean_continuum_window` no
+longer pushes its lower bound up past the dome
+(`BACKSCATTER_FLOOR_MEV`, removed); instead `fit_run_continuum` jointly
+fits `a_continuum * klein_nishina_continuum_shape + a_dome *
+Gaussian(center=backscatter_energy(E_top), free amplitude/width)`
+whenever the window actually covers the dome region (62/4181 runs — a
+companion below ~0.6 MeV is needed to leave the dome inside the window
+at all), else continuum-amplitude-only as before. **Honest result, not
+a success story**: held-out dome-amplitude relative difference is
+median 269.5%, mean 216.0%, max 617.9% (11 held-out points, 13 train
+curve bins) — the dome is only measurable over a narrow slice of runs,
+so this first-pass Gaussian-bump model is data-starved and noisy.
+Visually (`compton_continuum_prediction_check.png`'s dome zoom-in) the
+*position* is clearly right and the *order of magnitude* is often
+reasonable, but don't trust individual amplitude predictions yet — a
+real, disclosed limitation, not swept under the rug. Continuum itself is
+unaffected/still excellent: median 2.1%, mean 2.9%, max 21.8%.
+
+**`response_function.py`**: `BgoResponseFunction` now stores `beta`/
+`intrinsic_k` (was `doppler_k`/`intrinsic_k`); `photopeak()` uses
+`gamma_physics.doppler_lineshape`; new `backscatter_dome()` method,
+added into `predict_spectrum`'s existing top-gamma-only contribution
+alongside the continuum. `full_energy_efficiency`'s convention is
+unchanged (still a resolution-independent area) but no longer needs the
+old `*sigma*sqrt(2*pi)` conversion factor, since the new lineshape is
+already a unit-area density.
+
+**Not done, genuine future work**: modeling the dome with more data (it
+would need many more zero/low-companion runs like `"calib1g"`, purpose-
+built to cover it, the same way that series was built for the continuum
+coverage gap); the Doppler-vs-intrinsic split for the *continuum*'s own
+edge sharpness (still an unconvolved raw Klein-Nishina shape, see that
+section above); every gamma except each cascade's own highest-energy
+one (Phase 2b, unchanged).
+
 ## Next steps
 
 1. ~~Fix the efficiency-curve interpolation issue~~ — **done 2026-09-17**,
@@ -605,11 +757,17 @@ strictly cleaner calibration data than anything else in this project.
    0.95 MeV (see "New calibration data closes most of the gap") and, as a
    side effect, discovered and corrected for a previously-invisible
    backscatter-peak contamination affecting *every* topology's continuum
-   window, not just the new one. Remaining: escape peaks, Compton edge
-   sharpness, modeling the backscatter dome itself (would reach
-   0.1-0.95 MeV), and every gamma *except* each cascade's own
-   highest-energy one — see that section's "Follow-on phases" (2a/2b) for
-   the concrete next steps and why they're phased this way.
+   window, not just the new one. **2026-09-19**: the backscatter dome
+   itself is now modeled (a physics-anchored-center Gaussian bump), not
+   just excluded — see "Doppler-broadened lineshape + backscatter-dome
+   model" below — but data-starved (only measurable where a companion
+   sits below ~0.6 MeV) and not yet reliable per-run (held-out amplitude
+   error ~270% median). Remaining: escape peaks, the continuum's own
+   Compton-edge sharpness (still unconvolved), more `"calib1g"`-style
+   dedicated runs to properly constrain the dome, and every gamma
+   *except* each cascade's own highest-energy one — see that section's
+   "Follow-on phases" (2a/2b) for the concrete next steps and why they're
+   phased this way.
 3. **(Now the clearest single lever on the remaining held-out efficiency
    error, per the 2026-09-17 diagnosis)** Fix the low-energy (<~0.5 MeV)
    efficiency contamination from the near-zero spike. **padsley's
@@ -634,3 +792,9 @@ strictly cleaner calibration data than anything else in this project.
    (3 gammas/event). Branching-ratio *variation* (not just more levels)
    still hasn't been scanned — every topology here is still 100%/100%
    branching throughout.
+6. ~~Peaks are fit with plain Gaussians, which don't describe the real
+   (Doppler-broadened) lineshape well~~ — **done 2026-09-19**, see
+   "Doppler-broadened lineshape + backscatter-dome model" above. Not
+   fully closed out: the continuum's own Compton-edge region is still an
+   *unconvolved* raw Klein-Nishina shape (no resolution smearing at all
+   near the edge) — the same kind of fix, not yet applied there.

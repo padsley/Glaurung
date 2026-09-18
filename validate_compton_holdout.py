@@ -1,20 +1,22 @@
-"""Held-out validation of the Compton-continuum fit in
-`fit_compton_continuum.py`, mirroring `validate_holdout.py`'s approach
-for the photopeak resolution/efficiency fit: hold out every 5th run
-(same `split_stems`, so results are directly comparable run-for-run),
-refit the continuum curve on the rest, check against runs the fit never
-saw.
+"""Held-out validation of the Compton-continuum (and backscatter-dome)
+fit in `fit_compton_continuum.py`, mirroring `validate_holdout.py`'s
+approach for the photopeak resolution/efficiency fit: hold out every
+5th run (same `split_stems`, so results are directly comparable
+run-for-run), refit the continuum/dome curves on the rest, check against
+runs the fit never saw.
 """
 from __future__ import annotations
 
 import numpy as np
 
-from fit_compton_continuum import DATASET_PATH, RESPONSE_PATH, build_continuum_curve, measure_all_continuum
+from fit_compton_continuum import (
+    DATASET_PATH, RESPONSE_PATH, build_continuum_curve, build_dome_curve, measure_all_continuum,
+)
 from validate_holdout import split_stems
 
 
 def run_validation(dataset_path=DATASET_PATH, response_path=RESPONSE_PATH, every_n=5, offset=4, rel_err_max=0.5):
-    rows, doppler_k, intrinsic_k = measure_all_continuum(dataset_path, response_path, verbose=False)
+    rows, beta, intrinsic_k = measure_all_continuum(dataset_path, response_path, verbose=False)
     all_stems = [r["stem"] for r in rows]
     train_stems, holdout_stems = split_stems(all_stems, every_n=every_n, offset=offset)
     print(f"{len(train_stems)} train runs, {len(holdout_stems)} held-out runs (every {every_n}th, offset {offset})")
@@ -43,12 +45,36 @@ def run_validation(dataset_path=DATASET_PATH, response_path=RESPONSE_PATH, every
           f"median={np.median(np.abs(clean_diff)) * 100:.1f}%, "
           f"mean={np.mean(np.abs(clean_diff)) * 100:.1f}%, max={np.max(np.abs(clean_diff)) * 100:.1f}%")
 
-    return {
+    result = {
         "holdout_energy": ho_energy[ho_good], "holdout_amplitude": ho_amp[ho_good],
         "holdout_amplitude_pred": ho_pred, "holdout_amplitude_rel_diff": ho_rel_diff,
         "holdout_clean_mask": ho_clean,
         "continuum_energy": continuum_energy, "continuum_curve": continuum_curve,
     }
+
+    # --- backscatter dome: same held-out check, only over rows whose window covered it ---
+    try:
+        dome_energy, dome_curve, dome_sigma_curve = build_dome_curve(train_rows, rel_err_max=rel_err_max)
+        print(f"[trained on train-only rows] dome curve: {len(dome_energy)} occupied bins")
+        ho_dome_rows = [r for r in holdout_rows if r["has_dome"]]
+        ho_dome_energy = np.array([r["energy"] for r in ho_dome_rows])
+        ho_dome_amp = np.array([r["dome_amplitude"] for r in ho_dome_rows])
+        ho_dome_rel_err = np.array([r["dome_rel_err"] for r in ho_dome_rows])
+        ho_dome_good = np.isfinite(ho_dome_rel_err) & (ho_dome_rel_err < rel_err_max)
+        ho_dome_pred = np.interp(ho_dome_energy[ho_dome_good], dome_energy, dome_curve)
+        ho_dome_rel_diff = (ho_dome_amp[ho_dome_good] - ho_dome_pred) / ho_dome_amp[ho_dome_good]
+        print(f"HELD-OUT dome-amplitude relative difference ({ho_dome_good.sum()} held-out points): "
+              f"median={np.median(np.abs(ho_dome_rel_diff)) * 100:.1f}%, "
+              f"mean={np.mean(np.abs(ho_dome_rel_diff)) * 100:.1f}%, max={np.max(np.abs(ho_dome_rel_diff)) * 100:.1f}%")
+        result.update({
+            "dome_energy": dome_energy, "dome_curve": dome_curve, "dome_sigma_curve": dome_sigma_curve,
+            "holdout_dome_energy": ho_dome_energy[ho_dome_good], "holdout_dome_amplitude": ho_dome_amp[ho_dome_good],
+            "holdout_dome_amplitude_pred": ho_dome_pred, "holdout_dome_amplitude_rel_diff": ho_dome_rel_diff,
+        })
+    except ValueError as exc:
+        print(f"dome held-out check: skipped ({exc})")
+
+    return result
 
 
 if __name__ == "__main__":

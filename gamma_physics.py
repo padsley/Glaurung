@@ -15,6 +15,7 @@ depositing recoil-electron energy `T` (MeV) at the interaction point.
 from __future__ import annotations
 
 import numpy as np
+from scipy.special import erf
 
 ELECTRON_MASS_MEV = 0.510999  # m_e*c^2 -- same constant/value used by the
                                # sibling G3 project's emulator.py for its
@@ -75,6 +76,71 @@ def klein_nishina_continuum_shape(E: np.ndarray, T: np.ndarray) -> np.ndarray:
         shape = Ep / E + E / Ep - sin2_theta
 
     return np.where(valid, shape, 0.0)
+
+
+def doppler_lineshape(E: np.ndarray, x: np.ndarray, beta: float, sigma_intrinsic: float) -> np.ndarray:
+    """Normalized (unit-area over `x`) photopeak lineshape for a gamma of
+    true energy `E` (MeV) emitted in flight by a recoil moving at
+    `beta` = v/c, observed by a detector array with near-full angular
+    coverage.
+
+    **Why not a Gaussian** (found 2026-09-18 comparing both against real
+    isolated, high-statistics peaks -- chi2/ndf 551 -> 218, a real,
+    checked improvement, not assumed): if the recoil emits this gamma
+    isotropically in its own rest frame and the array's solid-angle
+    coverage is close to uniform over the full 4*pi, the Doppler-shifted
+    true energy `E*(1 + beta*cos(theta))` has a *uniform* (not peaked)
+    density between `E*(1-beta)` and `E*(1+beta)` -- because an isotropic
+    distribution has a uniform density in `cos(theta)`, and the shift is
+    linear in `cos(theta)`. This is the standard lineshape for
+    recoil-in-flight gamma spectroscopy with a large-solid-angle array:
+    a "box" of true-energy density, then rounded off by whatever
+    additional (non-kinematic: light-collection, electronic) resolution
+    the detector itself contributes, `sigma_intrinsic`. Convolving a
+    uniform box with a Gaussian has the closed form used below (a
+    difference of two error functions) -- a smoothly-rounded flat-top,
+    not a bell curve. Real BGO angular acceptance is not a perfectly
+    sharp-edged box (chi2/ndf=218, not 1, confirms some residual
+    mismatch), but this is a large, physically-motivated improvement,
+    not a full geometric model of the array (that would need Ancalagon's
+    actual crystal positions -- out of scope here).
+    """
+    E = np.asarray(E, dtype=np.float64)
+    x = np.asarray(x, dtype=np.float64)
+    sigma_intrinsic = np.abs(sigma_intrinsic)
+    x1, x2 = E * (1.0 - beta), E * (1.0 + beta)
+    return (erf((x - x1) / (np.sqrt(2.0) * sigma_intrinsic)) - erf((x - x2) / (np.sqrt(2.0) * sigma_intrinsic))) / (2.0 * (x2 - x1))
+
+
+def effective_sigma(E: np.ndarray, beta: float, sigma_intrinsic: float) -> np.ndarray:
+    """Variance-equivalent width of `doppler_lineshape` -- *not* a claim
+    that the lineshape is Gaussian (it isn't), just a single-number
+    stand-in for "how wide is this peak" for callers that only need to
+    size a fit window or a peak-exclusion zone, not the lineshape itself
+    (e.g. `fit_compton_continuum.py`'s window logic). Box variance
+    `(beta*E)^2/3` (a uniform distribution of half-width `beta*E`) plus
+    the intrinsic Gaussian's own variance, combined in quadrature.
+    """
+    E = np.asarray(E, dtype=np.float64)
+    return np.sqrt((beta * E) ** 2 / 3.0 + sigma_intrinsic**2)
+
+
+def backscatter_energy(E: np.ndarray) -> np.ndarray:
+    """Energy (MeV) of a photon Compton-backscattered (theta=180 deg) off
+    material *before* reaching the sensitive crystal, then fully
+    absorbed there -- the "backscatter peak/dome" seen in real gamma
+    spectra. This is simply the scattered-photon energy at the Compton
+    edge: `E - compton_edge_energy(E)` (`compton_edge_energy` is the
+    *transferred* energy at theta=180; what's left in the photon is the
+    rest). Asymptotes to `m_e*c^2/2 ~= 0.2555 MeV` for `E >> m_e*c^2/2`,
+    the textbook high-energy backscatter-peak position; at the true
+    energies this dataset actually probes (0.6-2.5 MeV, where the dome
+    was found 2026-09-18) it instead runs ~0.18-0.23 MeV, checked by
+    hand against where the dome was visually located before trusting
+    this formula for it.
+    """
+    E = np.asarray(E, dtype=np.float64)
+    return E - compton_edge_energy(E)
 
 
 def escape_peak_energies(E: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

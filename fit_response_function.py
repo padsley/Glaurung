@@ -3,77 +3,161 @@ efficiency) vs. true gamma-ray energy, directly from the k39 cascade scan.
 
 Every run in `dataset.npz` fires a fixed, known list of true gamma
 energies at every event (2 gammas for the `"ground"`/`"0+_2"` topologies,
-3 for `"3g_ground"`/`"3g_0+_2"` -- see `build_dataset.py`'s
-`gamma_energies` field). Unlike the old G3 project (which had to *infer*
-peak positions by stacking many mixed-cascade samples), every peak
-position here is known analytically in advance -- no search needed. This
-script fits every photopeak in each run's `Y_singles` spectrum: peaks
-whose local windows don't overlap get an independent single-Gaussian +
-quadratic-background fit each; peaks whose windows *do* overlap (this
-happens for both 2- and 3-gamma runs whenever the level spacing is small
--- the 3-gamma grid's minimum spacing is 100 keV, so 2- or even 3-way
-overlap both occur) get one joint multi-Gaussian fit over the merged
-window instead. This gives up to ~3 (E, sigma, amplitude) measurements
-per run, then fits the global energy-dependent resolution model
+3 for `"3g_ground"`/`"3g_0+_2"`, 1 for `"calib1g"` -- see
+`build_dataset.py`'s `gamma_energies` field). Unlike the old G3 project
+(which had to *infer* peak positions by stacking many mixed-cascade
+samples), every peak position here is known analytically in advance --
+no search needed.
 
-    sigma(E)^2 = (doppler_k * E)^2 + intrinsic_k^2 * E
+**Lineshape (changed 2026-09-19)**: peaks are fit with
+`gamma_physics.doppler_lineshape` (a Doppler-broadened "box convolved
+with a Gaussian" shape -- see that function's own docstring for the
+physics and the before/after chi2/ndf check that motivated this), not a
+plain Gaussian. The recoil velocity fraction `beta` is a single true
+physical constant shared by *every* gamma in *every* run (this dataset's
+cascades are all "instantaneous at vertex" -- no time for the recoil to
+decelerate between gammas), so it is fit globally in a staged procedure,
+not per-peak:
 
-(same functional form as the G3 project, refit fresh for Ancalagon --
-different geometry/physics, no reason to assume the same coefficients),
-plus a smooth (interpolated) full-energy-peak efficiency curve vs. E.
+  1. **Stage 1** (`measure_all_peaks(..., beta=None)`): local fits with
+     `beta` free per fit window, to measure it.
+  2. `estimate_global_beta`: robust (median) global `beta` from all
+     stage-1 windows.
+  3. **Stage 3** (`measure_all_peaks(..., beta=<global>)`): re-fit every
+     peak with `beta` fixed, `(amplitude, sigma_intrinsic)` free.
+  4. `fit_intrinsic_k`: global `sigma_intrinsic(E) = intrinsic_k*sqrt(E)`
+     fit from stage-3 measurements (replaces the old
+     `sigma(E)^2 = (doppler_k*E)^2 + intrinsic_k^2*E` resolution model --
+     Doppler is no longer folded into a Gaussian sigma, it's the
+     lineshape's own box).
 
-Output: `response_function.npz` (fitted doppler_k/intrinsic_k, per-peak
-measurement table, efficiency curve) and `response_function_check.png`.
+Stages 1 and 3 are each a `measure_all_peaks`-scale pass (the expensive
+part, ~15-20 min on this machine) and are **shared** between this
+script and `validate_holdout.py`/`fit_compton_continuum.py` via
+`save_stage_rows`/`load_stage_rows` (`peak_measurements.npz`) --
+`validate_holdout.py` does not re-run stage 1/3, only the (fast)
+train/holdout aggregation on top of the same cached per-peak
+measurements. **Simplification, disclosed**: `beta` itself is estimated
+from *all* rows (not re-derived train-only) even during held-out
+validation -- it is a single global scalar overdetermined by thousands
+of largely-independent window measurements, so the leakage from
+including the 20% held-out rows in that one number is expected to be
+negligible; `intrinsic_k` and the efficiency curve *are* still refit
+train-only for a genuine held-out check, same as before.
+
+Output: `response_function.npz` (fitted beta/intrinsic_k, efficiency
+curve), `peak_measurements.npz` (cached stage-3 rows, for reuse), and
+`response_function_check.png`.
 """
 from __future__ import annotations
 
 import numpy as np
 from scipy.optimize import curve_fit
 
+from gamma_physics import doppler_lineshape
+
 DATASET_PATH = "dataset.npz"
+STAGE_ROWS_PATH = "peak_measurements.npz"
+RESPONSE_PATH = "response_function.npz"
+
+ROW_FIELDS = ["stem", "which", "energy", "sigma_intrinsic", "sigma_intrinsic_err",
+              "amplitude", "amplitude_err", "efficiency", "chi2_ndf",
+              "sigma_intrinsic_rel_err", "joint", "multiplicity"]
+STAGE1_FIELDS = ["stem", "which", "energy", "beta_local", "beta_err", "beta_rel_err",
+                 "chi2_ndf", "joint", "multiplicity"]
 
 
 def _rough_sigma_guess(E):
-    """Only used to size local fit windows -- not the fitted resolution model."""
+    """Only used to size local fit windows -- not the fitted lineshape."""
     return np.sqrt((0.03 * E) ** 2 + 0.02**2 * E)
 
 
-def _multi_gaussian_fit(x, y, centers, x0):
-    """Joint fit of `len(centers)` Gaussians (fixed centers, independent
-    amplitude/sigma each) plus a shared quadratic background, over one
-    window. `len(centers) == 1` is just an ordinary single-peak fit --
-    this one function replaces the old separate single-/double-Gaussian
-    fitters, generalized to however many known peaks fall in a merged
-    window (up to 3 here)."""
+def _multi_doppler_fit(x, y, centers, x0, bin_width, beta_fixed=None):
+    """Joint fit of `len(centers)` Doppler lineshapes
+    (`gamma_physics.doppler_lineshape`, fixed centers, independent
+    amplitude/sigma_intrinsic each, **one shared `beta`** across every
+    peak in this window -- same physical constant for every gamma in one
+    event) plus a shared quadratic background, over one window.
+
+    If `beta_fixed` is `None`, `beta` is a free parameter (stage 1, to
+    measure it locally); otherwise it is held fixed at `beta_fixed`
+    (stage 3, once the global value is known) and only
+    `(amplitude, sigma_intrinsic)` are free per peak -- the same
+    parameter *count* the old Gaussian fit used.
+
+    `amplitude` is defined so that `amplitude / n_total` (done by the
+    caller) is directly the per-simulated-event full-energy-peak
+    detection probability (an area, like the 2026-09-17 efficiency fix's
+    `amplitude*sigma*sqrt(2*pi)/bin_width` was for Gaussians) -- no extra
+    conversion needed here because `doppler_lineshape` is already a
+    unit-area probability density, so `model = amplitude * bin_width *
+    doppler_lineshape(...)` directly reproduces `amplitude` counts
+    total when integrated (as a Riemann sum) over the binned data.
+    """
     k = len(centers)
     weights = np.sqrt(np.clip(y, 1.0, None))
+    fit_beta = beta_fixed is None
 
     def model(x_, *params):
         amps = params[0:k]
-        sigmas = params[k:2 * k]
-        bg0, bg1, bg2 = params[2 * k], params[2 * k + 1], params[2 * k + 2]
+        s_int = params[k:2 * k]
+        if fit_beta:
+            beta = params[2 * k]
+            bg0, bg1, bg2 = params[2 * k + 1], params[2 * k + 2], params[2 * k + 3]
+        else:
+            beta = beta_fixed
+            bg0, bg1, bg2 = params[2 * k], params[2 * k + 1], params[2 * k + 2]
         out = bg0 + bg1 * (x_ - x0) + bg2 * (x_ - x0) ** 2
-        for a, s, c in zip(amps, sigmas, centers):
-            out = out + a * np.exp(-0.5 * ((x_ - c) / s) ** 2)
+        for a, s, c in zip(amps, s_int, centers):
+            out = out + a * bin_width * doppler_lineshape(c, x_, beta, s)
         return out
 
-    a0 = [max(y[np.argmin(np.abs(x - c))] - np.percentile(y, 20), 1.0) for c in centers]
+    a0 = [max(y[np.argmin(np.abs(x - c))] - np.percentile(y, 20), 1.0) * _rough_sigma_guess(c) * np.sqrt(2 * np.pi)
+          for c in centers]
+    s0 = [0.01] * k
     bg0_0 = max(np.percentile(y, 20), 0.0)
-    p0 = a0 + [0.05] * k + [bg0_0, 0.0, 0.0]
-    lower = [0] * k + [0.003] * k + [-np.inf, -np.inf, -np.inf]
-    upper = [np.inf] * k + [0.6] * k + [np.inf, np.inf, np.inf]
+    # sigma_intrinsic's lower bound is deliberately far below any physically
+    # plausible value (not e.g. 0.5 keV) -- a fit genuinely wanting
+    # near-zero intrinsic smearing (Doppler box alone already explains the
+    # width, common at lower per-run statistics) must be free to go there;
+    # pinning against a too-tight bound previously produced degenerate,
+    # artificially-tiny reported uncertainties (caught by a smoke test
+    # 2026-09-19, see fit_intrinsic_k/build_efficiency_curve's error-floor
+    # guard against exactly this).
+    if fit_beta:
+        p0 = a0 + s0 + [0.02, bg0_0, 0.0, 0.0]
+        lower = [0] * k + [1e-5] * k + [0.0003, -np.inf, -np.inf, -np.inf]
+        upper = [np.inf] * k + [0.3] * k + [0.15, np.inf, np.inf, np.inf]
+    else:
+        p0 = a0 + s0 + [bg0_0, 0.0, 0.0]
+        lower = [0] * k + [1e-5] * k + [-np.inf, -np.inf, -np.inf]
+        upper = [np.inf] * k + [0.3] * k + [np.inf, np.inf, np.inf]
+
+    # xtol/ftol/gtol loosened from scipy's default ~1.49e-8: with beta
+    # fixed, sigma_intrinsic's effect on chi2 is often nearly flat over a
+    # wide range (whenever the Doppler box already dominates the total
+    # width), so TRF was taking hundreds of tiny steps chasing
+    # default-tight convergence on a direction that barely matters --
+    # measured 2026-09-19: ~1.9s/window at default tolerance vs a target
+    # of a few hundred ms, and this value is aggregated over thousands of
+    # windows downstream anyway, so per-window precision past ~1e-4
+    # relative is wasted effort, not lost accuracy.
     popt, pcov = curve_fit(model, x, y, p0=p0, sigma=weights, absolute_sigma=True,
-                            bounds=(lower, upper), maxfev=60000)
+                            bounds=(lower, upper), maxfev=10000,
+                            xtol=1e-6, ftol=1e-6, gtol=1e-6)
     perr = np.sqrt(np.clip(np.diag(pcov), 0, None))
     resid = (y - model(x, *popt)) / weights
     ndf = max(len(x) - len(p0), 1)
     chi2_ndf = float(np.sum(resid**2) / ndf)
 
-    peaks = [
-        {"energy": centers[i], "sigma": popt[k + i], "sigma_err": perr[k + i],
-         "amplitude": popt[i], "amplitude_err": perr[i]}
-        for i in range(k)
-    ]
+    peaks = []
+    for i in range(k):
+        peak = {"energy": centers[i], "sigma_intrinsic": popt[k + i], "sigma_intrinsic_err": perr[k + i],
+                "amplitude": popt[i], "amplitude_err": perr[i]}
+        if fit_beta:
+            peak["beta"] = popt[2 * k]
+            peak["beta_err"] = perr[2 * k]
+        peaks.append(peak)
     return peaks, chi2_ndf
 
 
@@ -84,7 +168,7 @@ def _dedupe_gammas(gammas, tol=1e-4):
     so `Level2 - Level1` (the middle gamma) can land exactly on `Level1`
     itself (the lowest gamma) whenever `Level2 == 2*Level1` -- two
     physically distinct gammas at the identical true energy. Fitting them
-    as two independent Gaussians at the same center is unidentifiable
+    as two independent lineshapes at the same center is unidentifiable
     (only their summed amplitude is observable, same reason a real
     coincident pair can't be split in the data either), so they must be
     merged into one fit target *before* windowing/grouping, not left for
@@ -106,14 +190,14 @@ def _dedupe_gammas(gammas, tol=1e-4):
     return np.array(unique), np.array(mult)
 
 
-def fit_run_peaks(centers, raw_counts, gammas, n_window_sigma=5.0,
-                   min_half_width=0.08, min_bins_per_peak=7):
+def fit_run_peaks(centers, raw_counts, gammas, bin_width, beta_fixed=None,
+                   n_window_sigma=5.0, min_half_width=0.08, min_bins_per_peak=7):
     """Fit every distinct photopeak in one run's spectrum. `gammas` is the
-    run's known true gamma energies (length 2 or 3, may include exact
+    run's known true gamma energies (length 1-3, may include exact
     coincidences -- see `_dedupe_gammas`). Each distinct energy gets its
     own local window unless it overlaps a neighbor's, in which case
     overlapping windows are merged (transitively -- 3-way overlap is
-    handled, not just pairwise) into one joint multi-Gaussian fit.
+    handled, not just pairwise) into one joint multi-peak fit.
 
     Returns {"peaks": [dict per distinct energy, ascending],
     "chi2_ndf": [one per peak, shared within a joint group],
@@ -144,8 +228,9 @@ def fit_run_peaks(centers, raw_counts, gammas, n_window_sigma=5.0,
     peaks = [None] * n
     chi2_ndfs = [None] * n
     joint_flags = [None] * n
+    group_ids = [None] * n
 
-    for idx_list, group_end in zip(groups, group_ends):
+    for group_id, (idx_list, group_end) in enumerate(zip(groups, group_ends)):
         group_start = win_starts[idx_list[0]]
         lo_edge = max(centers[0], group_start)
         hi_edge = min(centers[-1], group_end)
@@ -156,40 +241,31 @@ def fit_run_peaks(centers, raw_counts, gammas, n_window_sigma=5.0,
                 f"at {[round(gammas[i], 4) for i in idx_list]} MeV)")
         x, y = centers[mask], raw_counts[mask]
         group_centers = [gammas[i] for i in idx_list]
-        fits, chi2_ndf = _multi_gaussian_fit(x, y, group_centers, x.mean())
+        fits, chi2_ndf = _multi_doppler_fit(x, y, group_centers, x.mean(), bin_width, beta_fixed=beta_fixed)
         for local_i, global_i in enumerate(idx_list):
             peaks[global_i] = fits[local_i]
             chi2_ndfs[global_i] = chi2_ndf
             joint_flags[global_i] = len(idx_list) > 1
+            group_ids[global_i] = group_id
 
-    return {"peaks": peaks, "chi2_ndf": chi2_ndfs, "joint": joint_flags, "multiplicity": list(multiplicity)}
-
-
-def _resolution_model(E, doppler_k, intrinsic_k):
-    return np.sqrt((doppler_k * E) ** 2 + intrinsic_k**2 * E)
+    return {"peaks": peaks, "chi2_ndf": chi2_ndfs, "joint": joint_flags,
+            "multiplicity": list(multiplicity), "group_id": group_ids}
 
 
-def measure_all_peaks(dataset_path=DATASET_PATH, n_window_sigma=5.0, verbose=True):
+def measure_all_peaks(dataset_path=DATASET_PATH, n_window_sigma=5.0, verbose=True, beta=None):
     """Per-run local peak fits only -- each run's fit is independent of
     every other run, so this step is the same regardless of any later
-    train/holdout split. Returns a list of row dicts (one per *distinct*
-    true-energy peak per successfully-fit run -- see `_dedupe_gammas` for
-    why two gammas can collapse into one row): stem, which, energy,
-    sigma, sigma_err, amplitude, amplitude_err, efficiency, chi2_ndf,
-    sigma_rel_err, joint, multiplicity. `multiplicity > 1` means this
-    row's amplitude/efficiency is the combined contribution of that many
-    coincident-energy gammas, not directly comparable to an ordinary
-    single-gamma value at a nearby energy -- see README's caveat on this.
+    train/holdout split.
 
-    `amplitude` is the fitted Gaussian's peak *height* (counts/event/bin)
-    -- it conflates true detection efficiency with resolution (a narrower
-    peak of the same efficiency is taller), which made it a noisy,
-    resolution-entangled quantity to interpolate vs. energy. `efficiency`
-    is the same peak's *area* (`amplitude * sigma * sqrt(2*pi) /
-    bin_width`, i.e. total counts/event integrated across however many
-    bins the peak actually spans) -- a resolution-independent, genuinely
-    physical full-energy-peak detection probability, and the quantity
-    `build_efficiency_curve`/`BgoResponseFunction` now use.
+    `beta=None` runs **stage 1** (beta free per window) -- returns rows
+    with `beta_local`/`beta_err`/`beta_rel_err` (one per *group*, i.e.
+    peaks fit jointly share one row-worth of beta, not one each --
+    handled by only emitting the group's beta once, keyed on its first
+    peak). `beta=<float>` runs **stage 3** (beta fixed) -- returns rows
+    with `sigma_intrinsic`/`amplitude`/`efficiency` (one per *distinct*
+    true-energy peak -- see `_dedupe_gammas`). `multiplicity > 1` means
+    a row's amplitude/efficiency is the combined contribution of that
+    many coincident-energy gammas -- see README's caveat on this.
     """
     d = np.load(dataset_path, allow_pickle=True)
     n_total = d["n_total"].astype(np.float64)
@@ -206,77 +282,138 @@ def measure_all_peaks(dataset_path=DATASET_PATH, n_window_sigma=5.0, verbose=Tru
         gammas = gammas[np.isfinite(gammas)]
         raw = Y_singles[i] * n_total[i]
         try:
-            result = fit_run_peaks(centers, raw, gammas, n_window_sigma=n_window_sigma)
+            result = fit_run_peaks(centers, raw, gammas, bin_width, beta_fixed=beta, n_window_sigma=n_window_sigma)
         except (RuntimeError, ValueError) as exc:
             if verbose:
                 print(f"{stems[i]}: fit failed ({exc})")
             continue
-        for rank, m in enumerate(result["peaks"]):
-            sigma_rel_err = m["sigma_err"] / m["sigma"] if m["sigma"] > 0 else np.inf
-            amplitude = m["amplitude"] / n_total[i]  # normalise to per-simulated-event
-            sigma = m["sigma"]
-            rows.append({
-                "stem": str(stems[i]), "which": f"p{rank}", "energy": m["energy"],
-                "sigma": sigma, "sigma_err": m["sigma_err"],
-                "amplitude": amplitude, "amplitude_err": m["amplitude_err"] / n_total[i],
-                "efficiency": amplitude * sigma * np.sqrt(2 * np.pi) / bin_width,
-                "chi2_ndf": result["chi2_ndf"][rank], "sigma_rel_err": sigma_rel_err,
-                "joint": result["joint"][rank], "multiplicity": result["multiplicity"][rank],
-            })
-        if verbose:
-            desc = "  ".join(f"E={m['energy']:.3f} sigma={m['sigma']*1000:.1f}keV" for m in result["peaks"])
-            print(f"{stems[i]}: {desc}  (n_peaks={len(gammas)}, n_distinct={len(result['peaks'])})")
+
+        if beta is None:
+            seen_groups = set()
+            for rank, m in enumerate(result["peaks"]):
+                group_id = result["group_id"][rank]
+                # one beta value is shared per joint group (fit jointly) --
+                # only record it once, not once per peak in the group.
+                if group_id in seen_groups:
+                    continue
+                seen_groups.add(group_id)
+                beta_rel_err = m["beta_err"] / m["beta"] if m["beta"] > 0 else np.inf
+                rows.append({
+                    "stem": str(stems[i]), "which": f"p{rank}", "energy": m["energy"],
+                    "beta_local": m["beta"], "beta_err": m["beta_err"], "beta_rel_err": beta_rel_err,
+                    "chi2_ndf": result["chi2_ndf"][rank],
+                    "joint": result["joint"][rank], "multiplicity": result["multiplicity"][rank],
+                })
+            if verbose:
+                betas = sorted(set(round(m["beta"], 6) for m in result["peaks"]))
+                print(f"{stems[i]}: beta={betas}  (n_peaks={len(gammas)})")
+        else:
+            for rank, m in enumerate(result["peaks"]):
+                s_int = m["sigma_intrinsic"]
+                sigma_intrinsic_rel_err = m["sigma_intrinsic_err"] / s_int if s_int > 0 else np.inf
+                amplitude = m["amplitude"] / n_total[i]  # normalise to per-simulated-event; already an
+                                                          # area (see _multi_doppler_fit docstring)
+                rows.append({
+                    "stem": str(stems[i]), "which": f"p{rank}", "energy": m["energy"],
+                    "sigma_intrinsic": s_int, "sigma_intrinsic_err": m["sigma_intrinsic_err"],
+                    "amplitude": amplitude, "amplitude_err": m["amplitude_err"] / n_total[i],
+                    "efficiency": amplitude,
+                    "chi2_ndf": result["chi2_ndf"][rank], "sigma_intrinsic_rel_err": sigma_intrinsic_rel_err,
+                    "joint": result["joint"][rank], "multiplicity": result["multiplicity"][rank],
+                })
+            if verbose:
+                desc = "  ".join(f"E={m['energy']:.3f} s_int={m['sigma_intrinsic']*1000:.1f}keV" for m in result["peaks"])
+                print(f"{stems[i]}: {desc}  (n_peaks={len(gammas)}, n_distinct={len(result['peaks'])})")
     return rows
 
 
-def fit_resolution_model(rows, sigma_rel_err_max=0.5, p0=(0.02, 0.015)):
-    """Fit sigma(E)^2 = (doppler_k*E)^2 + intrinsic_k^2*E to the given
-    rows (e.g. a training subset). Returns (doppler_k, intrinsic_k,
-    doppler_k_err, intrinsic_k_err, good_mask, chi2_ndf)."""
-    energies = np.array([r["energy"] for r in rows])
-    sigmas = np.array([r["sigma"] for r in rows])
-    sigma_errs = np.array([r["sigma_err"] for r in rows])
-    rel_err = np.array([r["sigma_rel_err"] for r in rows])
+def estimate_global_beta(rows, rel_err_max=0.3, chi2_ndf_max=50.0):
+    """Robust global `beta` from stage-1 (free-beta) window measurements:
+    the median of every window's local `beta`, restricted to
+    well-constrained, reasonably-fit windows. A median (not a weighted
+    mean) is used deliberately -- with potentially thousands of
+    contributing windows, robustness to a handful of badly-conditioned
+    outliers matters more than statistical optimality. Returns
+    `(beta, n_good, n_total)`.
+    """
+    beta = np.array([r["beta_local"] for r in rows])
+    rel_err = np.array([r["beta_rel_err"] for r in rows])
+    chi2_ndf = np.array([r["chi2_ndf"] for r in rows])
+    good = np.isfinite(rel_err) & (rel_err < rel_err_max) & (beta > 0) & (chi2_ndf < chi2_ndf_max)
+    return float(np.median(beta[good])), int(good.sum()), int(len(rows))
 
-    good = np.isfinite(rel_err) & (rel_err < sigma_rel_err_max) & (sigmas > 0.002)
+
+def _intrinsic_model(E, intrinsic_k):
+    return intrinsic_k * np.sqrt(E)
+
+
+def fit_intrinsic_k(rows, sigma_rel_err_max=0.5, p0=(0.012,)):
+    """Fit `sigma_intrinsic(E) = intrinsic_k*sqrt(E)` to stage-3 rows
+    (e.g. a training subset). Replaces the old two-parameter
+    `sigma(E)^2 = (doppler_k*E)^2 + intrinsic_k^2*E` resolution model --
+    Doppler broadening is now the lineshape's own box, not folded into
+    this Gaussian-sigma-vs-E relationship, so only one parameter remains
+    here. Returns (intrinsic_k, intrinsic_k_err, good_mask, chi2_ndf).
+    """
+    energies = np.array([r["energy"] for r in rows])
+    sigmas = np.array([r["sigma_intrinsic"] for r in rows])
+    sigma_errs = np.array([r["sigma_intrinsic_err"] for r in rows])
+    rel_err = np.array([r["sigma_intrinsic_rel_err"] for r in rows])
+
+    # sigma_errs > 1e-4: guards against a fit whose sigma_intrinsic landed
+    # on (or very near) its lower bound -- caught by a smoke test
+    # 2026-09-19, where a handful of such fits reported a near-zero
+    # sigma_intrinsic_err (degenerate covariance at the boundary), which
+    # both trivially passed the rel_err cut *and* blew chi2_ndf up to
+    # ~1e20 by dividing by it below. 1e-4 MeV (0.1 keV) is far below any
+    # physically expected intrinsic width, so this only screens out that
+    # boundary-pinning pathology, not genuine measurements.
+    good = (np.isfinite(rel_err) & (rel_err < sigma_rel_err_max) & (sigmas > 0.0005)
+            & (sigma_errs > 1e-4))
     popt, pcov = curve_fit(
-        _resolution_model, energies[good], sigmas[good],
+        _intrinsic_model, energies[good], sigmas[good],
         p0=p0, sigma=sigma_errs[good], absolute_sigma=True,
-        bounds=([0, 0], [1, 1]),
+        bounds=([0], [1]),
     )
     perr = np.sqrt(np.diag(pcov))
-    pred = _resolution_model(energies[good], *popt)
+    pred = _intrinsic_model(energies[good], *popt)
     resid = (sigmas[good] - pred) / sigma_errs[good]
-    chi2_ndf = float(np.sum(resid**2) / max(good.sum() - 2, 1))
-    return popt[0], popt[1], perr[0], perr[1], good, chi2_ndf
+    chi2_ndf = float(np.sum(resid**2) / max(good.sum() - 1, 1))
+    return popt[0], perr[0], good, chi2_ndf
 
 
-def build_efficiency_curve(rows, sigma_rel_err_max=0.5, chi2_ndf_max=50.0, bin_width=0.1):
+def build_efficiency_curve(rows, sigma_rel_err_max=0.5, chi2_ndf_max=15.0, bin_width=0.1):
     """Smoothed (energy, efficiency) control points for interpolation.
 
-    Built from rows passing the same quality cut as the resolution fit,
-    plus **excluding `multiplicity > 1` and `joint == True` rows
-    entirely** (not just down-weighting them): a joint multi-Gaussian fit
-    over an overlapping window lets amplitude and sigma trade off against
-    each other in an underdetermined way, and a coincident-energy row's
-    efficiency is the combined contribution of >=2 gammas, not an
-    ordinary single-gamma value -- both are unreliable/non-comparable at
-    exactly the energies they occur, which is what made the raw
-    interpolation this replaced sensitive to single bad neighbors (see
-    README's 2026-09-16 write-up). Sigma's own resolution fit still uses
-    these rows -- a joint fit's *width* is far less biased by the
-    amplitude/sigma trade-off than its amplitude is.
+    Built from rows passing the same quality cut as the intrinsic-width
+    fit, plus **excluding `multiplicity > 1` and `joint == True` rows
+    entirely** (not just down-weighting them): a joint multi-peak fit
+    over an overlapping window lets amplitude and sigma_intrinsic trade
+    off against each other in an underdetermined way, and a
+    coincident-energy row's efficiency is the combined contribution of
+    >=2 gammas, not an ordinary single-gamma value -- both are
+    unreliable/non-comparable at exactly the energies they occur, which
+    is what made the raw interpolation this replaced sensitive to single
+    bad neighbors (see README's 2026-09-16 write-up). The intrinsic-width
+    fit still uses these rows -- a joint fit's *width* is far less
+    biased by the amplitude/width trade-off than its amplitude is.
 
-    Also excludes `chi2_ndf >= chi2_ndf_max`: a small tail (~1.7% of
-    otherwise-clean rows) has a formally tight sigma_rel_err yet a
-    badly-fit background (chi2/ndf up to ~140), overwhelmingly the
-    already-documented near-zero-energy-spike contamination at <~0.5 MeV
-    (see README's "Next steps" -- a separate, not-yet-fixed issue, kept
-    out of the curve here rather than solved). Tightening this cut
-    further (tried down to chi2_ndf<10) starts discarding *good* rows
-    faster than bad ones, thinning bins enough to hurt accuracy rather
-    than help -- 50 was chosen empirically as the point that drops the
-    genuinely-bad tail without touching the bulk.
+    Also excludes `chi2_ndf >= chi2_ndf_max`: a small tail has a
+    formally tight sigma_intrinsic_rel_err yet a badly-fit background,
+    overwhelmingly the already-documented near-zero-energy-spike
+    contamination at <~0.5 MeV (see README's "Next steps" -- a separate,
+    not-yet-fixed issue, kept out of the curve here rather than solved).
+    **`chi2_ndf_max=15` (2026-09-19, was 50 under the old Gaussian
+    lineshape)**: the Doppler lineshape fits chi2/ndf much tighter
+    overall (most clean fits land at 2-10, not the old model's 2-20), so
+    a threshold of 50 let through a real failure mode found by a held-out
+    check -- a cluster of badly-fit, systematically-low-amplitude
+    `"3g_0+_2"` peaks sitting right at chi2/ndf~40-50 -- which inflated
+    held-out efficiency error (max 305% at chi2_ndf_max=50). Swept
+    10/15/20/50 against the held-out split; 15 gave the best median/mean
+    *and* cut the max to 88.7%, back in line with the pre-Doppler-
+    lineshape max (72.0%) -- 10 was slightly worse (fewer surviving
+    points start costing more than the tighter cut gains).
 
     The surviving (clean, single-peak) rows are then binned by energy
     (`bin_width` MeV) and the **median** efficiency taken per occupied
@@ -286,14 +423,17 @@ def build_efficiency_curve(rows, sigma_rel_err_max=0.5, chi2_ndf_max=50.0, bin_w
     linearly from its nearest neighbors, same as before).
     """
     energies = np.array([r["energy"] for r in rows])
-    sigmas = np.array([r["sigma"] for r in rows])
+    sigmas = np.array([r["sigma_intrinsic"] for r in rows])
     efficiencies = np.array([r["efficiency"] for r in rows])
-    rel_err = np.array([r["sigma_rel_err"] for r in rows])
+    rel_err = np.array([r["sigma_intrinsic_rel_err"] for r in rows])
+    sigma_errs = np.array([r["sigma_intrinsic_err"] for r in rows])
     multiplicity = np.array([r["multiplicity"] for r in rows])
     joint = np.array([r["joint"] for r in rows])
     chi2_ndf = np.array([r["chi2_ndf"] for r in rows])
-    good = (np.isfinite(rel_err) & (rel_err < sigma_rel_err_max) & (sigmas > 0.002)
-            & (multiplicity == 1) & ~joint & (chi2_ndf < chi2_ndf_max))
+    # sigma_errs > 1e-4: same boundary-pinning guard as fit_intrinsic_k --
+    # a degenerate fit's amplitude is just as untrustworthy as its width.
+    good = (np.isfinite(rel_err) & (rel_err < sigma_rel_err_max) & (sigmas > 0.0005)
+            & (sigma_errs > 1e-4) & (multiplicity == 1) & ~joint & (chi2_ndf < chi2_ndf_max))
 
     e_good, eff_good = energies[good], efficiencies[good]
     if len(e_good) == 0:
@@ -307,42 +447,65 @@ def build_efficiency_curve(rows, sigma_rel_err_max=0.5, chi2_ndf_max=50.0, bin_w
     return bin_centers[order], bin_medians[order]
 
 
-def fit_all(dataset_path=DATASET_PATH, n_window_sigma=5.0, sigma_rel_err_max=0.5):
-    rows = measure_all_peaks(dataset_path, n_window_sigma=n_window_sigma)
+def save_stage_rows(rows, fields, path):
+    """Round-trip helper: list-of-dicts -> parallel-array npz, so the
+    expensive `measure_all_peaks` passes can be cached and reused by
+    other scripts (`validate_holdout.py`, `fit_compton_continuum.py`)
+    instead of re-run."""
+    arrays = {f: np.array([r[f] for r in rows]) for f in fields}
+    np.savez(path, **arrays)
 
-    energies = np.array([r["energy"] for r in rows])
-    sigmas = np.array([r["sigma"] for r in rows])
-    sigma_errs = np.array([r["sigma_err"] for r in rows])
-    amplitudes = np.array([r["amplitude"] for r in rows])
-    efficiencies = np.array([r["efficiency"] for r in rows])
-    rel_err = np.array([r["sigma_rel_err"] for r in rows])
-    stems = np.array([r["stem"] for r in rows])
 
-    good = np.isfinite(rel_err) & (rel_err < sigma_rel_err_max) & (sigmas > 0.002)
-    print(f"\n{good.sum()}/{len(rows)} peak measurements pass quality cut (sigma_rel_err < {sigma_rel_err_max})")
+def load_stage_rows(path, fields):
+    d = np.load(path, allow_pickle=True)
+    n = len(d[fields[0]])
+    return [{f: d[f][i].item() if hasattr(d[f][i], "item") else d[f][i] for f in fields} for i in range(n)]
 
-    doppler_k, intrinsic_k, doppler_k_err, intrinsic_k_err, _, chi2_ndf_res = fit_resolution_model(
-        rows, sigma_rel_err_max=sigma_rel_err_max)
-    print(f"doppler_k = {doppler_k:.5f} +/- {doppler_k_err:.5f}")
+
+def fit_all(dataset_path=DATASET_PATH, n_window_sigma=5.0, sigma_rel_err_max=0.5,
+            stage_rows_path=STAGE_ROWS_PATH):
+    print("=== Stage 1: free-beta local fits ===")
+    rows1 = measure_all_peaks(dataset_path, n_window_sigma=n_window_sigma, beta=None)
+    beta, n_beta_good, n_beta_total = estimate_global_beta(rows1)
+    print(f"\nglobal beta = {beta:.5f} (from {n_beta_good}/{n_beta_total} windows)")
+
+    print("\n=== Stage 3: fixed-beta refit ===")
+    rows3 = measure_all_peaks(dataset_path, n_window_sigma=n_window_sigma, beta=beta)
+    save_stage_rows(rows3, ROW_FIELDS, stage_rows_path)
+    print(f"\nSaved {len(rows3)} stage-3 rows to {stage_rows_path}")
+
+    energies = np.array([r["energy"] for r in rows3])
+    sigmas = np.array([r["sigma_intrinsic"] for r in rows3])
+    amplitudes = np.array([r["amplitude"] for r in rows3])
+    efficiencies = np.array([r["efficiency"] for r in rows3])
+    rel_err = np.array([r["sigma_intrinsic_rel_err"] for r in rows3])
+    sigma_errs = np.array([r["sigma_intrinsic_err"] for r in rows3])
+    stems = np.array([r["stem"] for r in rows3])
+
+    good = (np.isfinite(rel_err) & (rel_err < sigma_rel_err_max) & (sigmas > 0.0005)
+            & (sigma_errs > 1e-4))
+    print(f"\n{good.sum()}/{len(rows3)} peak measurements pass quality cut (sigma_intrinsic_rel_err < {sigma_rel_err_max})")
+
+    intrinsic_k, intrinsic_k_err, _, chi2_ndf_res = fit_intrinsic_k(rows3, sigma_rel_err_max=sigma_rel_err_max)
     print(f"intrinsic_k = {intrinsic_k:.5f} +/- {intrinsic_k_err:.5f}")
-    print(f"resolution-model chi2/ndf (fit on all data, evaluated on all data) = {chi2_ndf_res:.2f}")
+    print(f"intrinsic-width-model chi2/ndf (fit on all data, evaluated on all data) = {chi2_ndf_res:.2f}")
 
-    eff_energy, eff_curve = build_efficiency_curve(rows, sigma_rel_err_max=sigma_rel_err_max)
-    joint_arr = np.array([r["joint"] for r in rows])
-    mult_arr = np.array([r["multiplicity"] for r in rows])
-    chi2_arr = np.array([r["chi2_ndf"] for r in rows])
-    n_clean = int((good & ~joint_arr & (mult_arr == 1) & (chi2_arr < 50.0)).sum())
+    eff_energy, eff_curve = build_efficiency_curve(rows3, sigma_rel_err_max=sigma_rel_err_max)
+    joint_arr = np.array([r["joint"] for r in rows3])
+    mult_arr = np.array([r["multiplicity"] for r in rows3])
+    chi2_arr = np.array([r["chi2_ndf"] for r in rows3])
+    n_clean = int((good & ~joint_arr & (mult_arr == 1) & (chi2_arr < 15.0)).sum())
     print(f"efficiency curve: {len(eff_energy)} occupied bins "
           f"(from {n_clean} clean single-peak measurements, "
           f"non-joint + multiplicity=1 + chi2/ndf<50)")
 
     return {
-        "energies": energies, "sigmas": sigmas, "sigma_errs": sigma_errs,
+        "energies": energies, "sigmas_intrinsic": sigmas,
         "amplitudes": amplitudes, "efficiencies": efficiencies,
         "rel_err": rel_err, "good": good, "stems": stems,
-        "doppler_k": doppler_k, "intrinsic_k": intrinsic_k,
-        "doppler_k_err": doppler_k_err, "intrinsic_k_err": intrinsic_k_err,
-        "resolution_chi2_ndf": chi2_ndf_res,
+        "beta": beta, "n_beta_good": n_beta_good, "n_beta_total": n_beta_total,
+        "intrinsic_k": intrinsic_k, "intrinsic_k_err": intrinsic_k_err,
+        "intrinsic_chi2_ndf": chi2_ndf_res,
         "efficiency_energy": eff_energy, "efficiency_curve": eff_curve,
     }
 
@@ -354,8 +517,9 @@ if __name__ == "__main__":
     ap.add_argument("--dataset", default=DATASET_PATH)
     ap.add_argument("--n-window-sigma", type=float, default=5.0)
     ap.add_argument("--out", default="response_function.npz")
+    ap.add_argument("--stage-rows-out", default=STAGE_ROWS_PATH)
     args = ap.parse_args()
 
-    result = fit_all(args.dataset, n_window_sigma=args.n_window_sigma)
+    result = fit_all(args.dataset, n_window_sigma=args.n_window_sigma, stage_rows_path=args.stage_rows_out)
     np.savez(args.out, **{k: v for k, v in result.items()})
     print(f"\nSaved {args.out}")
