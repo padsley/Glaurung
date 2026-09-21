@@ -65,15 +65,20 @@ from parse_reaction import find_reaction_files, parse_reaction_file
 
 DEFAULT_REACTIONS_DIR = os.path.expanduser("~/codes/Ancalagon/reactions")
 DEFAULT_RESULTS_DIR = os.path.expanduser("~/data/Ancalagon_k39_results")
-MAX_GAMMAS = 3
+MAX_GAMMAS = 4
 # (topology label, glob pattern relative to reactions_dir) -- order matters
-# only for output ordering.
+# only for output ordering. 2026-09-21: densified the ground/0+_2/3g
+# families in place (new files share the existing glob patterns, no
+# change needed here) and added 4g_ground/4g_0+_2 as part of the dense
+# combinatorial-grid campaign (see README).
 DEFAULT_TOPOLOGIES = [
     ("ground", "k39pg_40ca_cascade_*.reaction"),
     ("0+_2", "k39pg_40ca_cascade0p2_*.reaction"),
     ("3g_ground", "k39pg_40ca_cascade3g/*.reaction"),
     ("3g_0+_2", "k39pg_40ca_cascade3g0p2/*.reaction"),
     ("calib1g", "k39pg_40ca_calib1g_*.reaction"),
+    ("4g_ground", "k39pg_40ca_cascade4g/*.reaction"),
+    ("4g_0+_2", "k39pg_40ca_cascade4g0p2/*.reaction"),
 ]
 
 
@@ -100,15 +105,26 @@ def _gamma_energies(rf, max_gammas: int = MAX_GAMMAS) -> np.ndarray:
 def _load_old_cache(path: str) -> dict[str, dict]:
     """Load a previously-built dataset.npz whose raw ROOT/run.log may no
     longer exist on disk, keyed by file stem, so its already-extracted
-    spectra can be reused instead of re-extracted."""
+    spectra can be reused instead of re-extracted.
+
+    Each of `d["<key>"]` below re-reads that array fresh from the npz
+    archive (NpzFile doesn't cache decompressed arrays across accesses)
+    -- pull them out ONCE before the loop, not per-row, or a
+    5000+-row cache blows up into tens of GB of redundant reads/
+    allocations (found via an OOM kill while merging this exact file)."""
     d = np.load(path, allow_pickle=True)
+    file_stems = d["file_stems"]
+    y_addback = d["Y_addback"]
+    y_singles = d["Y_singles"]
+    n_total_arr = d["n_total"]
+    n_hit_arr = d["n_hit"]
     cache = {}
-    for i, stem in enumerate(d["file_stems"]):
+    for i, stem in enumerate(file_stems):
         cache[str(stem)] = {
-            "Y_addback": d["Y_addback"][i],
-            "Y_singles": d["Y_singles"][i],
-            "n_total": int(d["n_total"][i]),
-            "n_hit": int(d["n_hit"][i]),
+            "Y_addback": y_addback[i],
+            "Y_singles": y_singles[i],
+            "n_total": int(n_total_arr[i]),
+            "n_hit": int(n_hit_arr[i]),
         }
     return cache
 

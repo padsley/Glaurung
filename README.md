@@ -794,6 +794,97 @@ to predict the correction from first principles instead of fitting it
 blind — neither attempted here, and not a quick follow-up if picked up
 again later.
 
+## Dense combinatorial simulation grid, for a future direct/empirical model (2026-09-21)
+
+padsley asked whether describing the spectrum directly and empirically
+(bin counts / a PCA-regression basis learned straight from simulated
+spectra, the same architecture the sibling `DRAGON_G3_Emulator` project
+uses) might work better than this project's physics-decomposed model,
+given the empirical-lineshape exploration above found no consistent
+detector-geometry correction to adopt. That approach's accuracy is
+bounded by how densely training data covers the *combinatorial* space
+of cascade gamma-energy combinations, so this phase focused on
+producing that dense dataset — **not** yet the new emulator itself,
+which is separate future work.
+
+**Confirmed before generating anything**: every intermediate "level" in
+every cascade topology here is a synthetic placeholder (documented in
+each `.reaction` file's own `COMM` header), so gamma energies can be
+placed anywhere on a grid without violating any real branching-ratio
+constraint. Total Ex = 8.93377 MeV is fixed. Unifying RECL formula
+(verified against every hand-written file before trusting it):
+`RECL(e_budget) = -25.91223 - e_budget`, where `e_budget` is the energy
+available above a cascade's terminus (Ex for true ground, `Ex - 3.3526`
+for the real 0+_2 state, or an arbitrary chosen energy for a
+calib1g-style single-gamma source) — reproduces every existing file's
+RECL value exactly.
+
+**New tooling** (`~/codes/Ancalagon/reactions/generate_reactions.py` +
+`build_grid.py`, no generator existed before): writes `.reaction` files
+for any topology (1-4 gammas) directly from a list of ordered level
+energies, reusing the exact card conventions of every hand-written file.
+4-gamma points use quasi-random (Sobol) sampling of the ordered
+`0 < L1 < L2 < L3 < e_budget` simplex (order-statistics-of-uniforms
+method) rather than a full grid, which would be combinatorially
+infeasible at this resolution (~20x the size of the existing 3-gamma
+grid). Verified with `--reaction-stats` across random samples of every
+new family before running anything — correct gamma multiplicities
+throughout (100% of events, every family).
+
+**Real per-run cost measured before committing to a campaign size**
+(same "measure before you commit" pattern as the `calib1g` series):
+cost tracks **total gamma energy carried, not gamma count** — a 1-gamma
+run at 0.05 MeV cost 1.14 MB/19s at 8000 events, but 2/3/4-gamma runs
+carrying most of the 8.93 MeV budget all cost about the same
+(~9.5 MB, ~23s), since total BGO Compton-interaction volume is set by
+the energy budget, not how many gammas carry it.
+
+**Disk**: freed 73 GB by deleting every existing run's raw
+`dragon_hits.root`/`run.log` (verified first: `dataset.npz` already had
+all 5426 spectra cached, so nothing was lost) before generating anything
+new. Final campaign, sized from the measured per-run cost and a
+~5000-run/~47 GB/~2 hr budget (padsley's call, given the disk headroom):
+151 new dense `calib1g` points (0.05 MeV step, full 0.1–8.8 MeV range,
+was 0.1 MeV step over only 0.1–2.5 MeV), 88+54 dense interstitial 2-gamma
+points (0.05 MeV step, both `ground`/`0+_2`), a 3000-point Sobol
+supplement to the existing 3-gamma grid (2184 ground + 816 0+_2,
+proportional to the existing 3828:1431 split), and 1700 new 4-gamma
+points (1237 ground + 463 0+_2) where there was previously zero
+coverage. All 4993 runs launched in parallel across 16 cores (batch
+launcher, resumable, `REACTION_INPUT` + `TRAJ_QUIET=1` env vars +
+`--track-reaction N`) — **zero failures**, actual cost 49 GB / 12076 s
+(~3.35 hr, longer than the ~2 hr estimate — real disk I/O contention
+across 16 parallel processes wasn't in the naive estimate).
+
+**A real bug found and fixed while merging the new runs into
+`dataset.npz`**: `build_dataset.py`'s `_load_old_cache` re-read the
+*entire* `Y_addback`/`Y_singles` arrays from the npz archive on every
+iteration of its per-row loop (`d["Y_addback"][i]` inside a
+5426-iteration loop, instead of pulling `d["Y_addback"]` out once
+first) — `NpzFile` doesn't cache decompressed arrays across accesses,
+so this was ~5426 redundant reloads of a 21.7 MB array, OOM-killing the
+process (confirmed via `resource.getrusage` instrumentation: 68 MB at
+row 0, dead before row 500). Fixed by loading each array once before
+the loop. **Lesson for this project**: a `NpzFile` object is not a
+plain dict — repeatedly indexing the same key inside a loop re-reads
+from the archive every time; pull arrays out once before looping.
+
+**Result**: `dataset.npz` grew from 5426 to **10419 rows**
+(`MAX_GAMMAS` bumped 3→4; two new topologies, `4g_ground`/`4g_0+_2`,
+added to `DEFAULT_TOPOLOGIES` — the densified 1g/2g/3g families needed
+no code change, matching their existing glob patterns automatically).
+Spot-checked new spectra across every new family: photopeak bin lands
+within 20-70 keV of the true top-gamma energy in every case, consistent
+with expected Doppler broadening plus 20 keV bin quantization — the
+grid's physics is behaving as intended. Raw ROOT/log files for the new
+runs deleted immediately after merging (same "safe once cached" check
+as the initial disk cleanup) — disk back to 73 GB free.
+
+**Not done, genuine future work**: the direct empirical regression/PCA
+emulator architecture itself — model choice, training, and validation
+against this project's own held-out split convention — is a separate,
+separately-scoped task, now that this denser dataset exists.
+
 ## Next steps
 
 1. ~~Fix the efficiency-curve interpolation issue~~ — **done 2026-09-17**,
