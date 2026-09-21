@@ -732,6 +732,68 @@ edge sharpness (still an unconvolved raw Klein-Nishina shape, see that
 section above); every gamma except each cascade's own highest-energy
 one (Phase 2b, unchanged).
 
+## Empirical peak-lineshape corrections — explored, not adopted (2026-09-20)
+
+padsley asked whether an empirical refinement on top of the box+Gaussian
+Doppler lineshape (e.g. "a box with a negative Gaussian component in
+it") could describe the real peak shapes better, reasoning that the
+detector's actual crystal positions/angular acceptance likely make the
+true density non-uniform across the box. Tried it properly rather than
+guessing: fit 6 candidate lineshapes — plain Gaussian, plain box (the
+current model), box+P1 (linear tilt), box+P2 (quadratic/"dome" term,
+Legendre P2), box+P1+P2, and box with a subtracted Gaussian "dip" — to 5
+real, isolated, high-statistics peaks (uncommitted scratch script, not
+kept in the repo).
+
+**A real numerical bug turned up first**: the exploration's numerical
+convolution resampled its integration grid from the trial
+`sigma_intrinsic` value on every `curve_fit` call, corrupting the
+finite-difference Jacobian (a tiny parameter step moved the grid itself,
+not just the kernel values on it) — symptom was the numerical
+reproduction of the existing closed-form box model landing at
+chi2/ndf=876 on a peak where the closed form gives 221. Fixed by
+switching to a **fixed** offset grid
+(`np.linspace(-0.35, 0.35, 1401)`, independent of the trial parameter);
+confirmed the fix by matching the closed form almost exactly (221.19 vs
+221.15) on the same peak. Same underlying lesson as the boundary-pinning
+issue above: a fit can look wrong for purely numerical reasons, not
+physical ones — worth checking for specifically before trusting a
+fitted result.
+
+One test peak (`k39pg_40ca_cascade0p2_30_3000keV`, E=3.00 MeV) fit badly
+(chi2/ndf 300+) under *every* candidate model, including the existing
+box. Traced to its companion gamma at 2.581 MeV, whose own Doppler box
+edge (~2.663 MeV) sits right at this peak's fit-window edge
+(2.666 MeV) — window contamination from the neighbor's tail, not a
+lineshape failure. Excluded from the comparison below.
+
+**Verdict, from the remaining 4 clean peaks: none of the empirical
+corrections are adopted.** P1/P2/dip each reduce chi2/ndf a little
+(3-15%, e.g. box 194.2→box+P1 188.3 on one peak) — but the *fitted
+correction itself* isn't stable across peaks that share the same
+detector: the P1 tilt coefficient `c1` came out **+0.12 and +0.15** on
+the two `cascade0p2`-series peaks but **-0.16 and -0.20** on the two
+`cascade`-series peaks. A real, fixed crystal-geometry asymmetry would
+have to have the same sign everywhere; a sign flip between run series
+is the signature of the fit absorbing each peak's local
+background/statistical noise, not a shared physical effect. `c2` (the
+P2 term) and the dip model's parameters show the same lack of
+consistency, and one dip fit pinned its width parameter at its upper
+bound — the same boundary-pinning artifact flagged earlier in this
+project, another sign of an unconstrained, overfit parameter rather
+than a real feature.
+
+**The plain box+Gaussian model (`gamma_physics.doppler_lineshape`)
+stays as the production lineshape.** The residual chi2/ndf on these
+very-high-statistics peaks (~190-225) is real and still not fully
+explained, but this exploration doesn't support closing it empirically
+with a low-order polynomial or ad-hoc dip correction. Closing it for
+real would need either far more counts per peak to separate a genuine
+small effect from noise, or actual Ancalagon crystal-position geometry
+to predict the correction from first principles instead of fitting it
+blind — neither attempted here, and not a quick follow-up if picked up
+again later.
+
 ## Next steps
 
 1. ~~Fix the efficiency-curve interpolation issue~~ — **done 2026-09-17**,
