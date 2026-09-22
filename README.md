@@ -885,6 +885,90 @@ emulator architecture itself — model choice, training, and validation
 against this project's own held-out split convention — is a separate,
 separately-scoped task, now that this denser dataset exists.
 
+## Cascade-context efficiency/sigma_intrinsic model, Phase A (2026-09-22)
+
+padsley asked for the empirical-model idea above to be scoped, then
+implemented. **Decisive prior evidence from the sibling
+`DRAGON_G3_Emulator` project informed the design**: that project already
+tried several purely empirical architectures (PCA+MLP, PCA+GBT, a
+no-PCA MLP, a NeRF-style coordinate net) for an analogous BGO-response
+problem, and all of them clearly underperformed a physics-basis hybrid
+(53-61% mean bin error vs. 34.7% for the hybrid, which keeps analytic
+peak/background basis functions and only uses ML to map cascade
+parameters onto their amplitudes). So Phase A does **not** throw away
+`gamma_physics.py`'s validated lineshape/continuum/dome shapes — it
+targets the one place a real gap could plausibly exist: `intrinsic_k`
+and `efficiency` are fit as smooth curves of a single gamma's own energy
+only (`fit_intrinsic_k`, `build_efficiency_curve`), independently per
+gamma, structurally blind to any cross-gamma effect (multiplicity,
+coincidence-summing, etc.) even if one is real. This is also exactly
+the historical reason (see the "Decided 2026-09-14" note near the top
+of this README) a per-cascade regressor was rejected originally — the
+dataset back then was a 1-2 parameter *energy scan*, not a genuine
+combinatorial grid. The dense-grid work above was what changed that.
+
+**Implementation** (`train_efficiency_model.py`): refit stage-3 peaks
+against the post-dense-grid `dataset.npz` first (`refit_stage3_dense.py`
+— the cached `peak_measurements.npz` was stale, from before the dense
+grid, 15868 rows/5426 runs; now 30730 rows/9988 runs, `beta` held fixed
+at its already-well-determined value, not re-derived). Built a feature
+vector per peak — `[this_gamma_energy, other gamma energies in the same
+cascade sorted descending (NaN-padded), multiplicity]` — and trained
+`sklearn.ensemble.HistGradientBoostingRegressor` (wrapped in
+`MultiOutputRegressor`) to predict `[efficiency, sigma_intrinsic]`
+jointly, the same architecture choice the sibling project already found
+beat every neural-net variant it tried. Same quality cut as
+`build_efficiency_curve` (single-peak, non-joint, `chi2_ndf<15`,
+`sigma_intrinsic_err>1e-4` boundary-pinning guard) applied to both
+targets, since they're now predicted jointly from one shared feature
+row. Same held-out convention as the rest of this project
+(`validate_holdout.split_stems`, every 5th run, offset 4), checked
+against the *identical* rows the existing marginal curves are checked
+against, so the comparison is directly apples-to-apples.
+
+**Result — a real, honest win, not uniform**:
+- **Efficiency: clear win.** Held-out relative error median 5.2%→2.7%,
+  mean 17.1%→5.0% (both roughly halved-to-3x-better) — passes the
+  pre-declared success criterion cleanly.
+- **sigma_intrinsic: a real but weaker win.** Median 42.6%→15.5%
+  (2.7x better) but mean only 59.1%→53.2% — dragged by a handful of
+  extreme relative-error outliers. **Checked, not just reported**: every
+  one of the worst outliers (both models' max errors, 1726%-2852%) has
+  a *true* sigma_intrinsic of 0.5-1 keV — right at the quality cut's own
+  floor (0.5 keV) — where a few keV of ordinary absolute miss balloons
+  into a four-digit relative error. Both the old marginal curve and the
+  new regressor predict similar *absolute* values there (~10-20 keV);
+  neither model captures these particular near-zero-width points, and
+  this is a known relative-error-metric pathology at small true values,
+  not a new failure mode the regressor introduced.
+- Spot-checked `predict_spectrum` (old curve-based vs. new
+  regressor-based) against real observed held-out spectra for a couple
+  of multi-gamma cascades — the new model tracks observed peak areas at
+  least as well as, and often better than, the old curves (e.g. one
+  peak: observed 0.0910, new 0.0908, old 0.1014 counts/event).
+
+**Shipped**: `efficiency_model.pkl` (trained on all 5811 quality-passing
+rows, not just the train split — same "validate with a split, ship the
+full-data fit" convention used throughout this project).
+`response_function.py`'s `BgoResponseFunction.load()` picks it up
+automatically when present (`predict_spectrum`'s photopeak sum now uses
+it); the old energy-only curves remain the automatic fallback if the
+file is absent, not removed.
+
+**Not done / explicitly deferred** (per the approved plan — only
+pursue if there's reason to, not automatically): Phase B (the same
+cascade-context treatment for the continuum and dome curves in
+`fit_compton_continuum.py` — their own held-out numbers don't obviously
+point at the same marginal-curve limitation Phase A targeted); Phase C
+(a pure whole-spectrum regressor, as a cheap sanity check against the
+sibling project's own finding that this underperforms); a closure-test
+style validation (inject known cascade parameters + Poisson noise,
+verify recovered amplitudes aren't biased) — the sibling project's own
+hard lesson is that bin/efficiency-level error alone doesn't guarantee
+unbiased recovered physics parameters, so this is worth budgeting for
+before fully trusting Phase A's numbers in a downstream "fit real data"
+use case, if/when one exists for this project.
+
 ## Next steps
 
 1. ~~Fix the efficiency-curve interpolation issue~~ — **done 2026-09-17**,

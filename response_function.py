@@ -39,6 +39,8 @@ part is still photopeak-only.
 """
 from __future__ import annotations
 
+import pickle
+
 import numpy as np
 
 from gamma_physics import backscatter_energy, compton_edge_energy, doppler_lineshape, klein_nishina_continuum_shape
@@ -51,11 +53,23 @@ class BgoResponseFunction:
                  continuum_curve: np.ndarray | None = None,
                  dome_energy: np.ndarray | None = None,
                  dome_curve: np.ndarray | None = None,
-                 dome_sigma_curve: np.ndarray | None = None):
+                 dome_sigma_curve: np.ndarray | None = None,
+                 efficiency_model=None, efficiency_model_max_gammas: int = 4):
         self.beta = beta
         self.intrinsic_k = intrinsic_k
         self.efficiency_energy = np.asarray(efficiency_energy)
         self.efficiency_curve = np.asarray(efficiency_curve)
+        # Optional (Phase A, 2026-09-22): a HistGradientBoostingRegressor
+        # predicting [efficiency, sigma_intrinsic] from a gamma's full
+        # cascade context (see train_efficiency_model.py) instead of from
+        # its own energy alone. Absent by default -- the curve-based
+        # model above stays the default/fallback, not replaced outright;
+        # only used by predict_spectrum's cascade-aware path below, never
+        # by the single-energy photopeak()/sigma_intrinsic()/
+        # full_energy_efficiency() methods (those have no cascade context
+        # to give it and keep their existing curve-based behavior).
+        self.efficiency_model = efficiency_model
+        self.efficiency_model_max_gammas = efficiency_model_max_gammas
         # Optional: absent means predict_spectrum falls back to
         # photopeak-only (pre-2026-09-17 behavior), e.g. when only
         # response_function.npz (no compton_continuum.npz) is available.
@@ -69,7 +83,8 @@ class BgoResponseFunction:
 
     @classmethod
     def load(cls, path: str = "response_function.npz",
-              continuum_path: str = "compton_continuum.npz") -> "BgoResponseFunction":
+              continuum_path: str = "compton_continuum.npz",
+              efficiency_model_path: str | None = "efficiency_model.pkl") -> "BgoResponseFunction":
         d = np.load(path)
         continuum_energy = continuum_curve = None
         dome_energy = dome_curve = dome_sigma_curve = None
@@ -81,11 +96,21 @@ class BgoResponseFunction:
                 dome_sigma_curve = c["dome_sigma_curve"]
         except FileNotFoundError:
             pass
+        efficiency_model, efficiency_model_max_gammas = None, 4
+        if efficiency_model_path is not None:
+            try:
+                with open(efficiency_model_path, "rb") as f:
+                    saved = pickle.load(f)
+                efficiency_model = saved["model"]
+                efficiency_model_max_gammas = saved["max_gammas"]
+            except FileNotFoundError:
+                pass
         return cls(
             beta=float(d["beta"]), intrinsic_k=float(d["intrinsic_k"]),
             efficiency_energy=d["efficiency_energy"], efficiency_curve=d["efficiency_curve"],
             continuum_energy=continuum_energy, continuum_curve=continuum_curve,
             dome_energy=dome_energy, dome_curve=dome_curve, dome_sigma_curve=dome_sigma_curve,
+            efficiency_model=efficiency_model, efficiency_model_max_gammas=efficiency_model_max_gammas,
         )
 
     def sigma_intrinsic(self, E: np.ndarray) -> np.ndarray:
@@ -133,6 +158,32 @@ class BgoResponseFunction:
         # doppler_lineshape is a unit-area density, so scaling by
         # efficiency*bin_width directly reproduces per-bin counts/event.
         return efficiency * bin_width * doppler_lineshape(E, energies, self.beta, sigma_intrinsic)
+
+    def _photopeaks_for_cascade(self, gamma_energies: list[float], energies: np.ndarray) -> np.ndarray:
+        """Sum of photopeak contributions for every gamma in a cascade.
+        Uses `efficiency_model` (if loaded) to predict each gamma's
+        `(efficiency, sigma_intrinsic)` jointly from its full cascade
+        context; falls back to the per-energy curves (`photopeak`) if no
+        model was loaded -- identical output to summing `photopeak(E,
+        energies)` over `gamma_energies` in that case."""
+        bin_width = energies[1] - energies[0] if len(energies) > 1 else 1.0
+        total = np.zeros_like(energies, dtype=np.float64)
+        if self.efficiency_model is None:
+            for E in gamma_energies:
+                total += self.photopeak(E, energies)
+            return total
+
+        from train_efficiency_model import feature_row  # local import: optional dependency
+
+        gammas_arr = np.array(gamma_energies, dtype=np.float64)
+        X = np.array([
+            feature_row(E, gammas_arr, max_gammas=self.efficiency_model_max_gammas)
+            for E in gamma_energies
+        ])
+        pred = self.efficiency_model.predict(X)  # columns: [efficiency, sigma_intrinsic]
+        for E, (efficiency, sigma_intrinsic) in zip(gamma_energies, pred):
+            total += efficiency * bin_width * doppler_lineshape(E, energies, self.beta, sigma_intrinsic)
+        return total
 
     def compton_continuum(self, E: float, energies: np.ndarray) -> np.ndarray:
         """Predicted Compton-continuum contribution (counts per simulated
@@ -197,9 +248,7 @@ class BgoResponseFunction:
         predicted spectrum is photopeak-only below the second-highest
         gamma)."""
         centers = 0.5 * (edges[:-1] + edges[1:])
-        total = np.zeros_like(centers)
-        for E in gamma_energies:
-            total += self.photopeak(E, centers)
+        total = self._photopeaks_for_cascade(gamma_energies, centers)
         if len(gamma_energies) > 0:
             e_top = max(gamma_energies)
             continuum = self.compton_continuum(e_top, centers)
